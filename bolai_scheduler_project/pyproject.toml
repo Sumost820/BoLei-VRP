@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bolai-scheduling"
+version = "0.1.0"
+description = "Gurobi model for differentiated task time and energy scheduling"
+requires-python = ">=3.10"
+dependencies = [
+    "gurobipy>=11.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
