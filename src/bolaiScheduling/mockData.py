@@ -72,11 +72,7 @@ def createMockData(taskCount, seed=1, stationCount=None, K=None, Q=100, QMin=20)
     maxServiceTime = max(p.values()) if p else 0
     maxTaskEnergy = max(q.values()) if q else 0
 
-    timeUpper = (
-        sum(p[i] for i in C)
-        + R * swapTime
-        + (taskCount + R + K) * maxTravelTime
-    )
+    timeUpper = (sum(p[i] for i in C) + R * swapTime + (taskCount + R + K) * maxTravelTime)
     energyUpper = Q + QMin + maxTravelEnergy + maxTaskEnergy
     M = round(max(timeUpper + maxServiceTime, energyUpper), 3)
 

@@ -60,26 +60,17 @@ class GurobiScheduler:
 
         for i, j in A:
             if j in C or j in S:
-                model.addConstr(
-                    T[j] >= T[i] + t[i, j] + p[j] - M * (1 - x[i, j]),
-                    name=f"timeLower_{i}_{j}",
-                )
+                model.addConstr(T[j] >= T[i] + t[i, j] + p[j] - M * (1 - x[i, j]), name=f"timeLower_{i}_{j}")
 
             if j in C:
-                model.addConstr(
-                    T[j] <= T[i] + t[i, j] + p[j] + M * (1 - x[i, j]),
-                    name=f"timeUpper_{i}_{j}",
-                )
+                model.addConstr(T[j] <= T[i] + t[i, j] + p[j] + M * (1 - x[i, j]), name=f"timeUpper_{i}_{j}")
 
         for j in S:
             inFlow = quicksum(x[i, j] for i in predecessors.get(j, []))
             model.addConstr(T[j] <= M * inFlow, name=f"unusedStationTime_{j}")
 
         for i in predecessors.get(endNode, []):
-            model.addConstr(
-                T[endNode] >= T[i] + t[i, endNode] - M * (1 - x[i, endNode]),
-                name=f"endTime_{i}",
-            )
+            model.addConstr(T[endNode] >= T[i] + t[i, endNode] - M * (1 - x[i, endNode]), name=f"endTime_{i}")
 
         for i in C:
             model.addConstr(E[i] >= QMin, name=f"energyMin_{i}")
@@ -87,20 +78,11 @@ class GurobiScheduler:
 
         for i, j in A:
             if j in C:
-                model.addConstr(
-                    E[j] >= E[i] - e[i, j] - q[j] - M * (1 - x[i, j]),
-                    name=f"energyLower_{i}_{j}",
-                )
-                model.addConstr(
-                    E[j] <= E[i] - e[i, j] - q[j] + M * (1 - x[i, j]),
-                    name=f"energyUpper_{i}_{j}",
-                )
+                model.addConstr(E[j] >= E[i] - e[i, j] - q[j] - M * (1 - x[i, j]), name=f"energyLower_{i}_{j}")
+                model.addConstr(E[j] <= E[i] - e[i, j] - q[j] + M * (1 - x[i, j]), name=f"energyUpper_{i}_{j}")
 
             if j in S or j == endNode:
-                model.addConstr(
-                    E[i] - e[i, j] >= QMin - M * (1 - x[i, j]),
-                    name=f"energyReach_{i}_{j}",
-                )
+                model.addConstr(E[i] - e[i, j] >= QMin - M * (1 - x[i, j]), name=f"energyReach_{i}_{j}")
 
         for j in S:
             inFlow = quicksum(x[i, j] for i in predecessors.get(j, []))
@@ -109,20 +91,10 @@ class GurobiScheduler:
         for r in range(len(S) - 1):
             currentStation = S[r]
             nextStation = S[r + 1]
-            currentIn = quicksum(
-                x[i, currentStation] for i in predecessors.get(currentStation, [])
-            )
-            nextIn = quicksum(
-                x[i, nextStation] for i in predecessors.get(nextStation, [])
-            )
+            currentIn = quicksum(x[i, currentStation] for i in predecessors.get(currentStation, []))
+            nextIn = quicksum(x[i, nextStation] for i in predecessors.get(nextStation, []))
             model.addConstr(nextIn <= currentIn, name=f"stationSymmetry_{r + 1}")
-            model.addConstr(
-                T[nextStation]
-                >= T[currentStation]
-                + p[currentStation]
-                - M * (1 - nextIn),
-                name=f"stationQueue_{r + 1}",
-            )
+            model.addConstr(T[nextStation] >= T[currentStation] + p[nextStation] - M * (1 - nextIn), name=f"stationQueue_{r + 1}")
 
         model.addConstr(T[startNode] == 0, name="startTime")
         model.addConstr(E[startNode] == Q, name="startEnergy")
