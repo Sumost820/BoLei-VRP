@@ -57,3 +57,5 @@ $$\sum_{i:(i,S^{r+1})\in \mathcal{A}}x_{iS^{r+1}} \leq \sum_{i:(i,S^{r})\in \mat
 $$T_{S^{r+1}}\geq T_{S^{r}}+p_{S^{r+1}}-M(1-\sum_{i:(i,S^{r+1})\in \mathcal{A}}x_{iS^{r+1}}), \quad \forall r=1,2\cdots,R-1$$
 11. $$起点初始化约束$$
 $$T_0=0,E_0=Q$$
+12. $$完工时间下界约束$$
+$$K\cdot T_{n+1} \geq \sum_{i\in \mathcal{C}}p_i+\sum_{(i,j) \in \mathcal{A}}t_{ij}x_{ij}+\sum_{r=1}^{R}p_{S^r}\sum_{i:(i,S^r)\in \mathcal{A}}x_{iS^r}$$
