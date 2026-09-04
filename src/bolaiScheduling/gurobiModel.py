@@ -78,11 +78,11 @@ class GurobiScheduler:
 
         for i, j in A:
             if j in C:
-                model.addConstr(E[j] >= E[i] - e[i, j] - q[j] - M * (1 - x[i, j]), name=f"energyLower_{i}_{j}")
-                model.addConstr(E[j] <= E[i] - e[i, j] - q[j] + M * (1 - x[i, j]), name=f"energyUpper_{i}_{j}")
+                model.addConstr(E[j] >= E[i] - e[i, j] - q[j] - 2 * Q * (1 - x[i, j]), name=f"energyLower_{i}_{j}")
+                model.addConstr(E[j] <= E[i] - e[i, j] - q[j] + 2 * Q * (1 - x[i, j]), name=f"energyUpper_{i}_{j}")
 
             if j in S or j == endNode:
-                model.addConstr(E[i] - e[i, j] >= QMin - M * (1 - x[i, j]), name=f"energyReach_{i}_{j}")
+                model.addConstr(E[i] - e[i, j] >= QMin - 2 * Q * (1 - x[i, j]), name=f"energyReach_{i}_{j}")
 
         for j in S:
             inFlow = quicksum(x[i, j] for i in predecessors.get(j, []))
@@ -98,6 +98,13 @@ class GurobiScheduler:
 
         model.addConstr(T[startNode] == 0, name="startTime")
         model.addConstr(E[startNode] == Q, name="startEnergy")
+
+        # 新增下界约束
+        taskServiceTime = quicksum(p[i] for i in C)
+        travelTime = quicksum(t[i, j] * x[i, j] for i, j in A)
+        swapTime = quicksum(p[i] * quicksum(x[j, i] for j in predecessors[i]) for i in S)
+        model.addConstr(K * T[endNode] >= taskServiceTime + travelTime + swapTime, name="totalWorkloadLowerBound")
+
 
         self.model = model
         self.x = x
