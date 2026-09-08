@@ -40,7 +40,6 @@ $$\sum_{j:(i,j)\in \mathcal{A}} x_{ij} = \sum_{j:(j,i)\in \mathcal{A}} x_{ji} = 
 $$\sum_{j:(i,j)\in \mathcal{A}} x_{ij} = \sum_{j:(j,i)\in \mathcal{A}} x_{ji} \leq 1，\quad \forall i \in \mathcal{S}$$
 4. $$节点离开时间约束$$
 $$T_j \geq T_i+t_{ij}+p_j-M(1-x_{ij}), \quad \forall (i,j) \in \mathcal{A},j \in \mathcal{C}\cup\mathcal{S}$$
-$$T_j \leq T_i+t_{ij}+p_j+M(1-x_{ij}), \quad \forall (i,j) \in \mathcal{A},j \in \mathcal{C}$$
 5. $$未使用的换电站，离开时间设定为0$$
 $$T_{j} \leq M\sum_{i:(i,j)\in \mathcal{A}}x_{ij}, \quad \forall j \in \mathcal{S}$$
 6. $$返回终点时间约束$$

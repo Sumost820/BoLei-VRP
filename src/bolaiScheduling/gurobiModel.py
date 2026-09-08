@@ -62,8 +62,8 @@ class GurobiScheduler:
             if j in C or j in S:
                 model.addConstr(T[j] >= T[i] + t[i, j] + p[j] - M * (1 - x[i, j]), name=f"timeLower_{i}_{j}")
 
-            if j in C:
-                model.addConstr(T[j] <= T[i] + t[i, j] + p[j] + M * (1 - x[i, j]), name=f"timeUpper_{i}_{j}")
+            # if j in C:
+            #     model.addConstr(T[j] <= T[i] + t[i, j] + p[j] + M * (1 - x[i, j]), name=f"timeUpper_{i}_{j}")
 
         for j in S:
             inFlow = quicksum(x[i, j] for i in predecessors.get(j, []))
