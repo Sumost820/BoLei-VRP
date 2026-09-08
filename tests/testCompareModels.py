@@ -3,9 +3,9 @@ import pytest
 pytest.importorskip("gurobipy")
 
 from gurobipy import GRB
-from bolaiScheduling.arcBasedGurobiModel import ArcBasedGurobiScheduler
-from bolaiScheduling.pathBasedGurobiModel import PathBasedGurobiScheduler
-from bolaiScheduling.mockData import createMockData
+from boleiScheduling.arcBasedGurobiModel import ArcBasedGurobiScheduler
+from boleiScheduling.pathBasedGurobiModel import PathBasedGurobiScheduler
+from boleiScheduling.mockData import createMockData
 
 
 def getModelResult(name, model):

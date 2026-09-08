@@ -2,8 +2,8 @@ import pytest
 
 pytest.importorskip("gurobipy")
 
-from bolaiScheduling.arcBasedGurobiModel import ArcBasedGurobiScheduler
-from bolaiScheduling.mockData import createMockData
+from boleiScheduling.arcBasedGurobiModel import ArcBasedGurobiScheduler
+from boleiScheduling.mockData import createMockData
 
 
 def getNodeName(node, data):

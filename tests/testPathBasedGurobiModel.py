@@ -2,8 +2,8 @@ import pytest
 
 pytest.importorskip("gurobipy")
 
-from bolaiScheduling.pathBasedGurobiModel import PathBasedGurobiScheduler
-from bolaiScheduling.mockData import createMockData
+from boleiScheduling.pathBasedGurobiModel import PathBasedGurobiScheduler
+from boleiScheduling.mockData import createMockData
 
 
 def getNodeName(node, data):
