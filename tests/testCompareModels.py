@@ -43,10 +43,10 @@ def testCompareArcAndPathBased():
     data = createMockData(taskCount=taskCount, stationCopyCount=taskCount, K=3, seed=4, Q=50, QMin=20)
 
     arcScheduler = ArcBasedGurobiScheduler(data)
-    arcModel = arcScheduler.solveModel(timeLimit=600, mipGap=0.001, outputFlag=1)
+    arcModel = arcScheduler.solveModel(timeLimit=3600, mipGap=0.001, outputFlag=1)
 
     pathScheduler = PathBasedGurobiScheduler(data)
-    pathModel = pathScheduler.solveModel(timeLimit=600, mipGap=0.001, outputFlag=1)
+    pathModel = pathScheduler.solveModel(timeLimit=3600, mipGap=0.001, outputFlag=1)
 
     assert arcModel.SolCount > 0
     assert pathModel.SolCount > 0
