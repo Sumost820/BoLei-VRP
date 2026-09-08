@@ -4,16 +4,16 @@ import random
 from .modelData import ModelData
 
 
-def createMockData(taskCount, seed=1, stationCount=None, K=None, Q=100, QMin=20):
+def createMockData(taskCount, seed=1, stationCopyCount=None, K=None, Q=100, QMin=20):
     random.seed(seed)
 
-    if stationCount is None:
-        stationCount = max(1, math.ceil(taskCount / 10))
+    if stationCopyCount is None:
+        stationCopyCount = max(1, math.ceil(taskCount / 10))
     if K is None:
         K = max(2, math.ceil(taskCount / 20))
 
     C = list(range(1, taskCount + 1))
-    S = list(range(taskCount + 1, taskCount + stationCount + 1))
+    S = list(range(taskCount + 1, taskCount + stationCopyCount + 1))
     R = len(S)
     n = taskCount + R
     startNode = 0
@@ -102,7 +102,7 @@ def saveMockData(taskCount, filePath, seed=1, stationCount=None, K=None, Q=100, 
     modelData = createMockData(
         taskCount=taskCount,
         seed=seed,
-        stationCount=stationCount,
+        stationCopyCount=stationCount,
         K=K,
         Q=Q,
         QMin=QMin,
