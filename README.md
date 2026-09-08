@@ -39,22 +39,20 @@ $$\sum_{j:(i,j)\in \mathcal{A}} x_{ij} = \sum_{j:(j,i)\in \mathcal{A}} x_{ji} = 
 3. $$换电站访问约束$$
 $$\sum_{j:(i,j)\in \mathcal{A}} x_{ij} = \sum_{j:(j,i)\in \mathcal{A}} x_{ji} \leq 1，\quad \forall i \in \mathcal{S}$$
 4. $$节点离开时间约束$$
-$$T_j \geq T_i+t_{ij}+p_j-M(1-x_{ij}), \quad \forall (i,j) \in \mathcal{A},j \in \mathcal{C}\cup\mathcal{S}$$
+$$T_j \geq T_i+t_{ij}+p_j-M(1-x_{ij}), \quad \forall (i,j) \in \mathcal{A},j \in \mathcal{C}\cup\mathcal{S}\cup\{n+1\}$$
 5. $$未使用的换电站，离开时间设定为0$$
 $$T_{j} \leq M\sum_{i:(i,j)\in \mathcal{A}}x_{ij}, \quad \forall j \in \mathcal{S}$$
-6. $$返回终点时间约束$$
-$$T_{n+1}\geq T_i+t_{i,n+1}-M(1-x_{i,n+1}),\quad \forall (i,n+1)\in \mathcal{A}$$
-7. $$电量合法性性约束$$
+6. $$电量合法性性约束$$
 $$Q^{min} \leq E_i \leq Q, \quad\forall i \in \mathcal{C}$$
-8. $$电量递推约束$$
+7. $$电量递推约束$$
 $$E_i-e_{ij}-q_j-M(1-x_{ij}) \leq E_j \leq E_i-e_{ij}-q_j+M(1-x_{ij}), \quad \forall (i,j) \in \mathcal{A}, j \in \mathcal{C}$$
 $$E_i-e_{ij} \geq Q_{min}-M(1-x_{ij}),\quad  \forall (i,j) \in \mathcal{A}, j \in \mathcal{S}\cup\{ n+1\}$$
 $$E_{j}=Q\sum_{i:(i,j)\in \mathcal{A}}x_{ij},  \quad \forall j \in \mathcal{S}$$
-9. $$换电站对称性消除$$
+8. $$换电站对称性消除$$
 $$\sum_{i:(i,S^{r+1})\in \mathcal{A}}x_{iS^{r+1}} \leq \sum_{i:(i,S^{r})\in \mathcal{A}}x_{iS^{r}}, \quad \forall r=1,2\cdots,R-1$$
-10. $$换电站排队约束$$
+9. $$换电站排队约束$$
 $$T_{S^{r+1}}\geq T_{S^{r}}+p_{S^{r+1}}-M(1-\sum_{i:(i,S^{r+1})\in \mathcal{A}}x_{iS^{r+1}}), \quad \forall r=1,2\cdots,R-1$$
-11. $$起点初始化约束$$
+10. $$起点初始化约束$$
 $$T_0=0,E_0=Q$$
-12. $$完工时间下界约束$$
+11. $$完工时间下界约束$$
 $$K\cdot T_{n+1} \geq \sum_{i\in \mathcal{C}}p_i+\sum_{(i,j) \in \mathcal{A}}t_{ij}x_{ij}+\sum_{r=1}^{R}p_{S^r}\sum_{i:(i,S^r)\in \mathcal{A}}x_{iS^r}$$
