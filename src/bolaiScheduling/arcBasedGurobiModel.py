@@ -1,7 +1,7 @@
 from gurobipy import GRB, Model, quicksum
 
 
-class GurobiScheduler:
+class ArcBasedGurobiScheduler:
     def __init__(self, modelData):
         self.modelData = modelData
         self.model = None
