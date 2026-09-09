@@ -8,18 +8,17 @@ class PathBasedGurobiScheduler:
         self.x = None
         self.T = None
         self.E = None
+        self.y = None
         self.s = None
         self.z = None
 
         self.P = []
         self.P0 = []
         self.PS = []
-        self.AS = []
+        self.swapOrderPairs = []
         self.origin = {}
         self.destination = {}
         self.stationNode = None
-        self.alpha = -1
-        self.omega = -2
 
     def buildModel(self):
         data = self.modelData
@@ -46,20 +45,22 @@ class PathBasedGurobiScheduler:
         energyNodes = [startNode] + C
 
         P0, PS, P, origin, destination = self.buildPaths(data, stationNode)
-        AS = self.buildStationArcs(PS)
+        swapOrderPairs = self.buildSwapOrderPairs(C)
 
         model = Model("BolaiPathBasedScheduling")
 
         x = model.addVars(P, vtype=GRB.BINARY, name="x")
         T = model.addVars(V, lb=0, ub=M, vtype=GRB.CONTINUOUS, name="T")
         E = model.addVars(energyNodes, lb=0, ub=Q, vtype=GRB.CONTINUOUS, name="E")
-        s = model.addVars(PS, lb=0, ub=M, vtype=GRB.CONTINUOUS, name="s")
-        z = model.addVars(AS, vtype=GRB.BINARY, name="z")
+        y = model.addVars(C, vtype=GRB.BINARY, name="y")
+        s = model.addVars(C, lb=0, ub=M, vtype=GRB.CONTINUOUS, name="s")
+        z = model.addVars(swapOrderPairs, vtype=GRB.BINARY, name="z")
 
         model.setObjective(T[endNode], GRB.MINIMIZE)
 
         pathIn = self.buildPathIn(P, destination)
         pathOut = self.buildPathOut(P, origin)
+        swapPathOut = self.buildPathOut(PS, origin)
 
         startCount = quicksum(x[path] for path in pathOut.get(startNode, []))
         endCount = quicksum(x[path] for path in pathIn.get(endNode, []))
@@ -72,20 +73,25 @@ class PathBasedGurobiScheduler:
             model.addConstr(inFlow == 1, name=f"taskIn_{i}")
             model.addConstr(outFlow == 1, name=f"taskOut_{i}")
 
+        for i in C:
+            swapFlow = quicksum(x[path] for path in swapPathOut.get(i, []))
+            model.addConstr(y[i] == swapFlow, name=f"swapUsed_{i}")
+            model.addConstr(s[i] <= M * y[i], name=f"unusedSwapTime_{i}")
+
+            if len(swapPathOut.get(i, [])) > 0:
+                model.addConstr(s[i] >= T[i] + t[i, stationNode] - M * (1 - y[i]), name=f"swapStart_{i}")
+
         for path in P0:
             i = origin[path]
             j = destination[path]
             serviceTime = p.get(j, 0)
-            model.addConstr(T[j] >= T[i] + t[i, j] + serviceTime - M * (1 - x[path]), name=f"timeDirect_{path}")
+            model.addConstr( T[j] >= T[i] + t[i, j] + serviceTime - M * (1 - x[path]), name=f"timeDirect_{path}")
 
         for path in PS:
             i = origin[path]
             j = destination[path]
             serviceTime = p.get(j, 0)
-
-            model.addConstr(s[path] >= T[i] + t[i, stationNode] - M * (1 - x[path]), name=f"swapStart_{path}")
-            model.addConstr(T[j] >= s[path] + swapTime + t[stationNode, j] + serviceTime - M * (1 - x[path]), name=f"timeSwap_{path}")
-            model.addConstr(s[path] <= M * x[path], name=f"unusedSwapTime_{path}")
+            model.addConstr(T[j] >= s[i] + swapTime + t[stationNode, j] + serviceTime - M * (1 - x[path]), name=f"timeSwap_{path}")
 
         for i in C:
             model.addConstr(E[i] >= QMin, name=f"energyMin_{i}")
@@ -97,47 +103,36 @@ class PathBasedGurobiScheduler:
             taskEnergy = q.get(j, 0)
 
             if j in C:
-                model.addConstr(E[j] >= E[i] - e[i, j] - taskEnergy - 2 * Q * (1 - x[path]), name=f"energyDirectLower_{path}")
-                model.addConstr(E[j] <= E[i] - e[i, j] - taskEnergy + 2 * Q * (1 - x[path]), name=f"energyDirectUpper_{path}")
+                model.addConstr(E[j] >= E[i] - e[i, j] - taskEnergy - M * (1 - x[path]), name=f"energyDirectLower_{path}")
+                model.addConstr(E[j] <= E[i] - e[i, j] - taskEnergy + M * (1 - x[path]), name=f"energyDirectUpper_{path}")
 
             if j == endNode:
-                model.addConstr(E[i] - e[i, j] - taskEnergy >= QMin - 2 * Q * (1 - x[path]), name=f"energyDirectEnd_{path}")
+                model.addConstr(E[i] - e[i, j] - taskEnergy >= QMin - M * (1 - x[path]), name=f"energyDirectEnd_{path}")
 
         for path in PS:
             i = origin[path]
             j = destination[path]
             taskEnergy = q.get(j, 0)
 
-            model.addConstr(E[i] - e[i, stationNode] >= QMin - 2 * Q * (1 - x[path]), name=f"energyReachStation_{path}")
+            model.addConstr(E[i] - e[i, stationNode] >= QMin - M * (1 - x[path]), name=f"energyReachStation_{path}")
 
             if j in C:
-                model.addConstr(E[j] >= Q - e[stationNode, j] - taskEnergy - 2 * Q * (1 - x[path]), name=f"energySwapLower_{path}")
-                model.addConstr(E[j] <= Q - e[stationNode, j] - taskEnergy + 2 * Q * (1 - x[path]), name=f"energySwapUpper_{path}")
+                model.addConstr(E[j] >= Q - e[stationNode, j] - taskEnergy - M * (1 - x[path]), name=f"energySwapLower_{path}")
+                model.addConstr(E[j] <= Q - e[stationNode, j] - taskEnergy + M * (1 - x[path]), name=f"energySwapUpper_{path}")
 
             if j == endNode:
-                model.addConstr(Q - e[stationNode, j] - taskEnergy >= QMin - 2 * Q * (1 - x[path]), name=f"energySwapEnd_{path}")
+                model.addConstr(Q - e[stationNode, j] - taskEnergy >= QMin - M * (1 - x[path]), name=f"energySwapEnd_{path}")
 
-        stationIn = self.buildPredecessors(AS)
-        stationOut = self.buildSuccessors(AS)
+        for i, k in swapOrderPairs:
+            model.addConstr(z[i, k] <= y[i], name=f"swapOrderUseI_{i}_{k}")
+            model.addConstr(z[i, k] <= y[k], name=f"swapOrderUseK_{i}_{k}")
 
-        for path in PS:
-            inFlow = quicksum(z[q, path] for q in stationIn.get(path, []))
-            outFlow = quicksum(z[path, q] for q in stationOut.get(path, []))
-            model.addConstr(inFlow == x[path], name=f"swapIn_{path}")
-            model.addConstr(outFlow == x[path], name=f"swapOut_{path}")
+            model.addConstr(
+                s[k] >= s[i] + swapTime - M * (1 - z[i, k]) - M * (2 - y[i] - y[k]), name=f"swapQueueIThenK_{i}_{k}"
+            )
 
-        alphaOut = quicksum(z[self.alpha, q] for q in stationOut.get(self.alpha, []))
-        omegaIn = quicksum(z[q, self.omega] for q in stationIn.get(self.omega, []))
-        model.addConstr(alphaOut == 1, name="swapChainStart")
-        model.addConstr(omegaIn == 1, name="swapChainEnd")
-
-        for path in PS:
-            for nextPath in PS:
-                if path == nextPath:
-                    continue
-                model.addConstr(
-                    s[nextPath] >= s[path] + swapTime - M * (1 - z[path, nextPath]), name=f"swapQueue_{path}_{nextPath}"
-                )
+            model.addConstr(
+                s[i] >= s[k] + swapTime - M * z[i, k] - M * (2 - y[i] - y[k]), name=f"swapQueueKThenI_{i}_{k}")
 
         model.addConstr(T[startNode] == 0, name="startTime")
         model.addConstr(E[startNode] == Q, name="startEnergy")
@@ -155,13 +150,14 @@ class PathBasedGurobiScheduler:
         self.x = x
         self.T = T
         self.E = E
+        self.y = y
         self.s = s
         self.z = z
 
         self.P = P
         self.P0 = P0
         self.PS = PS
-        self.AS = AS
+        self.swapOrderPairs = swapOrderPairs
         self.origin = origin
         self.destination = destination
         self.stationNode = stationNode
@@ -229,11 +225,12 @@ class PathBasedGurobiScheduler:
         events = []
         for path in self.PS:
             if self.x[path].X > 0.5:
+                i = self.origin[path]
                 events.append({
                     "path": path,
-                    "origin": self.origin[path],
+                    "origin": i,
                     "destination": self.destination[path],
-                    "startTime": self.s[path].X,
+                    "startTime": self.s[i].X,
                 })
 
         events.sort(key=lambda event: event["startTime"])
@@ -277,19 +274,13 @@ class PathBasedGurobiScheduler:
         P = P0 + PS
         return P0, PS, P, origin, destination
 
-    def buildStationArcs(self, PS):
-        AS = [(self.alpha, self.omega)]
-
-        for path in PS:
-            AS.append((self.alpha, path))
-            AS.append((path, self.omega))
-
-        for path in PS:
-            for nextPath in PS:
-                if path != nextPath:
-                    AS.append((path, nextPath))
-
-        return AS
+    @staticmethod
+    def buildSwapOrderPairs(C):
+        swapOrderPairs = []
+        for index, i in enumerate(C):
+            for k in C[index + 1:]:
+                swapOrderPairs.append((i, k))
+        return swapOrderPairs
 
     @staticmethod
     def buildPathIn(P, destination):
@@ -306,17 +297,3 @@ class PathBasedGurobiScheduler:
             node = origin[path]
             pathOut.setdefault(node, []).append(path)
         return pathOut
-
-    @staticmethod
-    def buildPredecessors(A):
-        predecessors = {}
-        for i, j in A:
-            predecessors.setdefault(j, []).append(i)
-        return predecessors
-
-    @staticmethod
-    def buildSuccessors(A):
-        successors = {}
-        for i, j in A:
-            successors.setdefault(i, []).append(j)
-        return successors
