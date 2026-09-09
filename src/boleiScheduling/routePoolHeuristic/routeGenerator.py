@@ -190,7 +190,7 @@ class RouteGenerator:
         if len(allTasks) <= 2:
             return candidate
 
-        removeCount = max(1, min(len(allTasks) // 5, 4))
+        removeCount = max(2, min(len(allTasks) // 5, 4))
         focusCandidates = [task for task in allTasks if task in self.focusTasks]
 
         removedTasks = []

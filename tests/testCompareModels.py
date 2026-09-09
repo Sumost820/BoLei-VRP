@@ -36,11 +36,12 @@ def printResult(result):
 
 
 def testCompareArcAndPathBased():
-    taskCount = 12
+    taskCount = 8
 
     # 两个模型共用同一个算例
     # Arc-based 需要足够多的换电站 copy，因此 stationCopyCount = taskCount
-    data = createMockData(taskCount=taskCount, stationCopyCount=taskCount, K=3, seed=4, Q=50, QMin=20)
+    data = createMockData(taskCount=taskCount, stationCopyCount=taskCount, K=2, seed=4, Q=50, QMin=20)
+    print(data)
 
     arcScheduler = ArcBasedGurobiScheduler(data)
     arcModel = arcScheduler.solveModel(timeLimit=7200, mipGap=0.001, outputFlag=1)

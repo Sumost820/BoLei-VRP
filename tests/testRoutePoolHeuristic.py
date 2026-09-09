@@ -7,13 +7,16 @@ from boleiScheduling.routePoolHeuristic.heuristicScheduler import RoutePoolHeuri
 
 
 def testRoutePoolHeuristicPrintsFinalRoutesAndSwapSchedule():
-    data = createMockData(taskCount=10, stationCopyCount=10, K=3, seed=4, Q=50, QMin=20)
+    taskCount = 8
+    data = createMockData(taskCount=taskCount, stationCopyCount=taskCount, K=2, seed=4, Q=50, QMin=20)
+    print(data)
+
 
     scheduler = RoutePoolHeuristicScheduler(
         data,
-        outerIterations=3,
-        ilsIterations=10,
-        variantsPerSequence=3,
+        outerIterations=10,
+        ilsIterations=30,
+        variantsPerSequence=5,
         maxPoolSize=1000,
         assemblerIterations=30,
         seed=4,

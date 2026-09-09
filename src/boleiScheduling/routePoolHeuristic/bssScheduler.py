@@ -99,8 +99,7 @@ class BssScheduler:
                 name=f"stationOrderBackward_{pairIndex}",
             )
 
-        model.setObjectiveN(CMax, index=0, priority=2, name="makespan")
-        model.setObjectiveN(quicksum(s[key] for key in eventKeys), index=1, priority=1, name="startTimeTieBreak")
+        model.setObjective(CMax, GRB.MINIMIZE)
         model.optimize()
 
         if model.SolCount == 0:
