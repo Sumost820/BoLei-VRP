@@ -1,23 +1,32 @@
 from dataclasses import dataclass
+from functools import lru_cache
 
 
-def route_sequence_arcs(tasks, start_node, end_node):
-    """
-    Directed successor arcs of a route's CUSTOMER sequence.
-
-    The BPC column identity is an ordered customer sequence; swap positions are
-    optimized separately. Therefore branching is performed on the compressed
-    route graph (depot/customers/depot), not on physical customer->BSS arcs.
-
-    For tasks=(i1,...,im), the arc set is
-        (start,i1), (i1,i2), ..., (im,end).
-    The empty route has no branching arcs.
-    """
-    tasks = tuple(tasks)
+@lru_cache(maxsize=None)
+def _route_sequence_arcs_cached(tasks, start_node, end_node):
     if not tasks:
         return ()
     nodes = (start_node,) + tasks + (end_node,)
     return tuple(zip(nodes[:-1], nodes[1:]))
+
+
+@lru_cache(maxsize=None)
+def _route_sequence_arc_set_cached(tasks, start_node, end_node):
+    return frozenset(_route_sequence_arcs_cached(tasks, start_node, end_node))
+
+
+def route_sequence_arcs(tasks, start_node, end_node):
+    """Directed successor arcs of the compressed customer sequence.
+
+    Results are cached by immutable customer sequence because branch
+    compatibility and arc-flow aggregation query the same route repeatedly
+    throughout the BPC tree.
+    """
+    return _route_sequence_arcs_cached(tuple(tasks), start_node, end_node)
+
+
+def route_sequence_arc_set(tasks, start_node, end_node):
+    return _route_sequence_arc_set_cached(tuple(tasks), start_node, end_node)
 
 
 @dataclass(frozen=True)
@@ -126,7 +135,7 @@ class ArcBranchingState:
         return True
 
     def isSequenceCompatible(self, slot, tasks, startNode, endNode):
-        arcs = set(route_sequence_arcs(tasks, startNode, endNode))
+        arcs = route_sequence_arc_set(tasks, startNode, endNode)
         return (
             self.requiredBySlot[slot].issubset(arcs)
             and not (self.forbiddenBySlot[slot] & arcs)
@@ -134,6 +143,21 @@ class ArcBranchingState:
 
     def isColumnCompatible(self, slot, column, startNode, endNode):
         return self.isSequenceCompatible(slot, column.tasks, startNode, endNode)
+
+    def canonicalKey(self):
+        """Vehicle-permutation-invariant key for homogeneous-slot symmetry.
+
+        Two branch nodes that differ only by a permutation of vehicle slots
+        represent the same subproblem because all vehicles are homogeneous and
+        every global cut in the current master is slot symmetric.
+        """
+        slotStates = []
+        for k in range(self.numberOfSlots):
+            slotStates.append((
+                tuple(sorted(self.requiredBySlot[k])),
+                tuple(sorted(self.forbiddenBySlot[k])),
+            ))
+        return tuple(sorted(slotStates))
 
     def describe(self):
         return {

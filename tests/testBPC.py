@@ -17,7 +17,7 @@ def _candidate_map(candidates):
 def testBranchPriceCutEndToEndSmallCase():
     pytest.importorskip('gurobipy')
     taskCount = 12
-    data = createMockData(taskCount=taskCount, stationCopyCount=taskCount, K=3, seed=4, Q=50, QMin=20)
+    data = createMockData(taskCount=taskCount, stationCopyCount=taskCount, K=2, seed=4, Q=50, QMin=20)
 
     solver = BranchPriceCutSolver(
         data,

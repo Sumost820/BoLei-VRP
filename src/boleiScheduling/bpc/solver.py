@@ -3,13 +3,16 @@ import math
 import time
 from dataclasses import dataclass, field
 
-from .master import RestrictedMasterProblem
+from .master import RestrictedMasterProblem, PersistentRestrictedMasterProblem
 from .pricing import ExactEnumerativePricing, ExactLabelingPricing
 from .swap_dp import ExactFixedSequenceEvaluator
 from .bss import ExactBssScheduler, BssScheduleResult
 from .cuts import BssOptimalityCut, ThreeRowSubsetCutSeparator
 from .branch import ArcBranchingState, ArcFlowBrancher
 from .savings import SavingsWarmStart
+from .columnManager import ColumnManager
+from .profiler import PerformanceProfiler
+from .cache import collectCacheStatistics
 
 
 def _format_number(value, digits=3):
@@ -60,11 +63,17 @@ class RootColumnGenerationSolver:
         savingsRandomization=0.20,
         savingsExcessRoutePenalty=1.0e9,
         maxWarmStartColumns=1000,
+        preGenerateShortRoutes=2,
+        shortRouteTaskThreshold=15,
+        maxShortRouteColumns=1000,
     ):
         self.data = modelData
-        self.sequenceEvaluator = ExactFixedSequenceEvaluator(modelData)
-        self.columns = [self.sequenceEvaluator.evaluate(())]
-        self.signatureToIndex = {(): 0}
+        self.profiler = PerformanceProfiler()
+        self.sequenceEvaluator = ExactFixedSequenceEvaluator(modelData, profiler=self.profiler)
+        emptyColumn = self.sequenceEvaluator.evaluate(())
+        self.columnManager = ColumnManager([emptyColumn])
+        self.columns = self.columnManager.columns
+        self.signatureToIndex = self.columnManager.signatureToIndex
         self.pricingMode = pricingMode
 
         if pricingMode == 'labeling':
@@ -98,6 +107,12 @@ class RootColumnGenerationSolver:
         self.savingsRandomization = max(0.0, float(savingsRandomization))
         self.savingsExcessRoutePenalty = float(savingsExcessRoutePenalty)
         self.maxWarmStartColumns = maxWarmStartColumns
+        self.preGenerateShortRoutes = max(0, int(preGenerateShortRoutes))
+        self.shortRouteTaskThreshold = max(0, int(shortRouteTaskThreshold))
+        self.maxShortRouteColumns = maxShortRouteColumns
+        self.shortRouteColumnsAdded = 0
+        self.shortRouteBuildTime = 0.0
+        self.shortRouteInitialized = False
         self.warmStartInitialized = False
         self.warmStartResult = None
         self.warmStartBuildTime = 0.0
@@ -110,18 +125,13 @@ class RootColumnGenerationSolver:
         self.status = 'NOT_SOLVED'
 
     def _existingSignatures(self):
-        return set(self.signatureToIndex)
+        return self.columnManager.signatures()
 
     def _addPricingCandidates(self, candidates):
-        added = 0
-        for candidate in candidates:
-            signature = candidate.column.signature
-            if signature in self.signatureToIndex:
-                continue
-            self.signatureToIndex[signature] = len(self.columns)
-            self.columns.append(candidate.column)
-            added += 1
-        return added
+        addedColumns = self.columnManager.addCandidates(candidates)
+        if addedColumns:
+            self.profiler.increment('globalColumnsAdded', len(addedColumns))
+        return addedColumns
 
     def _initializeWarmStart(self, outputFlag=0):
         if self.warmStartInitialized:
@@ -141,18 +151,16 @@ class RootColumnGenerationSolver:
             maxInitialColumns=self.maxWarmStartColumns,
         )
         result = builder.build()
-        added = 0
-        for column in result.columns:
-            signature = column.signature
-            if signature in self.signatureToIndex:
-                continue
-            self.signatureToIndex[signature] = len(self.columns)
-            self.columns.append(column)
-            added += 1
+        addedColumns = self.columnManager.addColumns(result.columns)
+        added = len(addedColumns)
+        if added:
+            self.profiler.increment('globalColumnsAdded', added)
 
         self.warmStartResult = result
         self.warmStartBuildTime = result.buildTime
         self.warmStartColumnsAdded = added
+        self.profiler.addTime('savingsWarmStart', result.buildTime)
+        self.profiler.increment('warmStartColumnsAdded', added)
 
         if outputFlag:
             bestRouteCount = len(result.bestRoutes) if result.bestRoutes else 0
@@ -163,6 +171,56 @@ class RootColumnGenerationSolver:
                 f'time={result.buildTime:.3f}s'
             )
         return result
+
+    def _initializeShortRoutePool(self, outputFlag=0):
+        """Pre-generate short exact routes for small instances.
+
+        This is only a warm-start device. It never restricts pricing and hence
+        cannot affect exactness. For N<=shortRouteTaskThreshold the default
+        adds all feasible singleton/pair customer sequences (singletons are
+        usually already present through savings and are deduplicated).
+        """
+        if self.shortRouteInitialized:
+            return self.shortRouteColumnsAdded
+        self.shortRouteInitialized = True
+
+        if (
+            self.preGenerateShortRoutes <= 0
+            or len(self.data.C) > self.shortRouteTaskThreshold
+        ):
+            return 0
+
+        import itertools as _itertools
+        start = time.perf_counter()
+        added = 0
+        cap = self.maxShortRouteColumns
+        tasks = tuple(self.data.C)
+
+        for length in range(1, min(self.preGenerateShortRoutes, len(tasks)) + 1):
+            for sequence in _itertools.permutations(tasks, length):
+                if sequence in self.signatureToIndex:
+                    continue
+                column = self.sequenceEvaluator.evaluate(sequence)
+                if column is None:
+                    continue
+                wasAdded, _ = self.columnManager.add(column)
+                if wasAdded:
+                    added += 1
+                    self.profiler.increment('globalColumnsAdded')
+                if cap is not None and added >= cap:
+                    break
+            if cap is not None and added >= cap:
+                break
+
+        self.shortRouteBuildTime = time.perf_counter() - start
+        self.shortRouteColumnsAdded = added
+        self.profiler.addTime('shortRouteWarmStart', self.shortRouteBuildTime)
+        if outputFlag and added:
+            print(
+                f'[SHORT ROUTES] exact sequences length<= {self.preGenerateShortRoutes} | '
+                f'+{added} columns | time={self.shortRouteBuildTime:.3f}s'
+            )
+        return added
 
     @staticmethod
     def _gurobiOutputFlag(outputFlag):
@@ -199,45 +257,58 @@ class RootColumnGenerationSolver:
             f'bestRC={rcText:>12} | {state}'
         )
 
-    def _solveCGPhase(
+    def _newPersistentMaster(
         self,
+        phase,
+        branchingState=None,
+        outputFlag=0,
+        timeLimit=None,
+    ):
+        return PersistentRestrictedMasterProblem(
+            self.data,
+            self.columns,
+            phase=phase,
+            bssCuts=(self.bssCuts if phase == 2 else None),
+            srcCuts=(self.srcCuts if phase == 2 else None),
+            branchingState=branchingState,
+            outputFlag=self._gurobiOutputFlag(outputFlag),
+            timeLimit=timeLimit,
+            profiler=self.profiler,
+            useDualSimplex=True,
+        )
+
+    def _runPersistentCG(
+        self,
+        master,
         phase,
         outputFlag=0,
         branchingState=None,
         timeLimit=None,
     ):
-        iteration = 0
+        """Run exact CG on an already-created persistent RMP."""
+        try:
+            from gurobipy import GRB
+        except ImportError as error:
+            raise ImportError('Column generation requires gurobipy') from error
 
+        iteration = 0
         while True:
             iteration += 1
             columnsBefore = len(self.columns)
 
-            master = RestrictedMasterProblem(
-                self.data,
-                self.columns,
-                bssCuts=(self.bssCuts if phase == 2 else None),
-                srcCuts=(self.srcCuts if phase == 2 else None),
-                branchingState=branchingState,
-            )
-            model = master.solve(
-                phase=phase,
-                outputFlag=self._gurobiOutputFlag(outputFlag),
-                binary=False,
-                timeLimit=timeLimit,
-            )
+            master.syncColumns(self.columns)
+            if phase == 2:
+                master.syncBssCuts(self.bssCuts)
+                master.syncSrcCuts(self.srcCuts)
 
-            try:
-                from gurobipy import GRB
-            except ImportError as error:
-                raise ImportError('RootColumnGenerationSolver requires gurobipy') from error
+            model = master.optimize(timeLimit=timeLimit)
+            self.master = master
 
             if model.Status == GRB.INFEASIBLE:
-                self.master = master
                 if outputFlag >= 2:
                     print(f'    [CG-P{phase}] iter={iteration:03d} | RMP infeasible')
                 return iteration, 'INFEASIBLE'
             if model.Status != GRB.OPTIMAL:
-                self.master = master
                 if outputFlag >= 2:
                     print(
                         f'    [CG-P{phase}] iter={iteration:03d} | '
@@ -251,13 +322,7 @@ class RootColumnGenerationSolver:
                 else master.getTValue()
             )
 
-            # Phase-I objective is sum of nonnegative artificial variables.
-            # If the current restricted master already attains zero, zero is
-            # the global Phase-I optimum and pricing cannot improve it. This
-            # exact shortcut is especially effective after the savings warm
-            # start supplies a K-route feasible solution.
             if phase == 1 and masterValue <= self.phaseOneTolerance:
-                self.master = master
                 if outputFlag >= 2:
                     print(
                         f'    [CG-P1] iter={iteration:03d} | '
@@ -267,11 +332,20 @@ class RootColumnGenerationSolver:
                 return iteration, 'OPTIMAL'
 
             duals = master.getDuals()
-            candidates = self.pricing.price(
-                duals=duals,
-                existingSignatures=self._existingSignatures(),
-                maxColumns=self.maxColumnsPerRound,
-                branchingState=branchingState,
+            with self.profiler.timeBlock('pricing'):
+                candidates = self.pricing.price(
+                    duals=duals,
+                    existingSignatures=self._existingSignatures(),
+                    maxColumns=self.maxColumnsPerRound,
+                    branchingState=branchingState,
+                )
+            self.profiler.increment('pricingCalls')
+            stats = getattr(self.pricing, 'lastStatistics', None) or {}
+            self.profiler.increment('pricingGeneratedLabels', stats.get('generatedLabels', 0))
+            self.profiler.increment('pricingAcceptedLabels', stats.get('acceptedLabels', 0))
+            self.profiler.increment(
+                'pricingDominanceComparisons',
+                stats.get('dominanceResourceComparisons', 0),
             )
 
             bestReducedCost = (
@@ -281,7 +355,6 @@ class RootColumnGenerationSolver:
             )
 
             if not candidates:
-                self.master = master
                 if outputFlag >= 2:
                     self._printCgProgress(
                         phase=phase,
@@ -294,7 +367,11 @@ class RootColumnGenerationSolver:
                     )
                 return iteration, 'OPTIMAL'
 
-            added = self._addPricingCandidates(candidates)
+            addedColumns = self._addPricingCandidates(candidates)
+            added = len(addedColumns)
+            if addedColumns:
+                master.addColumns(addedColumns)
+
             if outputFlag >= 2:
                 self._printCgProgress(
                     phase=phase,
@@ -307,11 +384,33 @@ class RootColumnGenerationSolver:
                 )
 
             if added == 0:
-                self.master = master
                 return iteration, 'OPTIMAL'
 
+    def _solveCGPhase(
+        self,
+        phase,
+        outputFlag=0,
+        branchingState=None,
+        timeLimit=None,
+    ):
+        master = self._newPersistentMaster(
+            phase=phase,
+            branchingState=branchingState,
+            outputFlag=outputFlag,
+            timeLimit=timeLimit,
+        )
+        return self._runPersistentCG(
+            master=master,
+            phase=phase,
+            outputFlag=outputFlag,
+            branchingState=branchingState,
+            timeLimit=timeLimit,
+        )
+
     def solve(self, outputFlag=0):
+        self.profiler.reset()
         self._initializeWarmStart(outputFlag=outputFlag)
+        self._initializeShortRoutePool(outputFlag=outputFlag)
         self.phaseOneIterations, status = self._solveCGPhase(phase=1, outputFlag=outputFlag)
         if status != 'OPTIMAL':
             self.status = f'PHASE1_{status}'
@@ -344,6 +443,10 @@ class RootColumnGenerationSolver:
             'pricingStatistics': getattr(self.pricing, 'lastStatistics', None),
             'warmStartColumnsAdded': self.warmStartColumnsAdded,
             'warmStartBuildTime': self.warmStartBuildTime,
+            'shortRouteColumnsAdded': self.shortRouteColumnsAdded,
+            'shortRouteBuildTime': self.shortRouteBuildTime,
+            'performanceProfile': self.profiler.snapshot(),
+            'cacheStatistics': collectCacheStatistics(self.sequenceEvaluator, None),
             'warmStartFeasibleStarts': (
                 self.warmStartResult.feasibleStarts
                 if self.warmStartResult is not None else 0
@@ -605,12 +708,16 @@ class BranchPriceCutSolver(RootColumnGenerationSolver):
         savingsExcessRoutePenalty=1.0e9,
         maxWarmStartColumns=1000,
         useSavingsIncumbent=True,
-        useSRC=True,
+        useSRC=False,
         srcViolationTolerance=1e-7,
         maxSrcCutsPerRound=10,
         maxSrcRoundsPerNode=5,
         maxTotalSrcCuts=100,
         srcMaxDepth=2,
+        preGenerateShortRoutes=2,
+        shortRouteTaskThreshold=15,
+        maxShortRouteColumns=1000,
+        deduplicateSymmetricNodes=True,
     ):
         super().__init__(
             modelData=modelData,
@@ -629,6 +736,9 @@ class BranchPriceCutSolver(RootColumnGenerationSolver):
             savingsRandomization=savingsRandomization,
             savingsExcessRoutePenalty=savingsExcessRoutePenalty,
             maxWarmStartColumns=maxWarmStartColumns,
+            preGenerateShortRoutes=preGenerateShortRoutes,
+            shortRouteTaskThreshold=shortRouteTaskThreshold,
+            maxShortRouteColumns=maxShortRouteColumns,
         )
 
         self.useSavingsIncumbent = bool(useSavingsIncumbent)
@@ -660,6 +770,7 @@ class BranchPriceCutSolver(RootColumnGenerationSolver):
             modelData=modelData,
             sequenceEvaluator=self.sequenceEvaluator,
             maxExactRouteTasks=maxExactRouteTasks,
+            profiler=self.profiler,
         )
 
         self.cutByKey = {}
@@ -681,6 +792,9 @@ class BranchPriceCutSolver(RootColumnGenerationSolver):
         self.srcCutsAdded = 0
         self.totalPhaseOneIterations = 0
         self.totalPhaseTwoIterations = 0
+        self.symmetricNodesSkipped = 0
+        self.phaseOneSkipped = 0
+        self.phaseOneActivated = 0
         self.runtime = 0.0
         self._deadline = None
         self._interrupted = False
@@ -688,6 +802,10 @@ class BranchPriceCutSolver(RootColumnGenerationSolver):
         self._lastNodePhaseOneIterations = 0
         self._lastNodePhaseTwoIterations = 0
         self.searchStrategy = 'BEST_BOUND'
+        self.deduplicateSymmetricNodes = bool(deduplicateSymmetricNodes)
+        self.symmetricNodesSkipped = 0
+        self.phaseOneSkipped = 0
+        self.phaseOneActivated = 0
 
     def _remainingTime(self):
         if self._deadline is None:
@@ -751,7 +869,11 @@ class BranchPriceCutSolver(RootColumnGenerationSolver):
         )
         print(
             'Tree     : BEST-BOUND (min inherited LP lower bound first) | '
-            'goal=stable global bound / gap progression'
+            f'symmetry-dedup={"ON" if self.deduplicateSymmetricNodes else "OFF"}'
+        )
+        print(
+            f'RMP      : persistent/incremental | short-route warm pool<='
+            f'{self.preGenerateShortRoutes} (N<={self.shortRouteTaskThreshold})'
         )
         print(
             f'SRC      : {"ON" if self.useSRC else "OFF"} | family=3-row | '
@@ -834,60 +956,155 @@ class BranchPriceCutSolver(RootColumnGenerationSolver):
 
         return len(violations), maxViolation
 
-    def _solveNodeLP(self, branchingState, outputFlag, nodeDepth=0):
+    def _solveNodeLP(
+        self,
+        branchingState,
+        outputFlag,
+        nodeDepth=0,
+        phaseTwoMaster=None,
+    ):
+        """Solve/re-solve one branch node with a persistent Phase-II RMP.
+
+        The restricted Phase-II master is tried first.  Phase I is activated
+        only when the current restricted Phase-II master is infeasible, which
+        means branch restrictions may require columns not yet in the global
+        pool.  A BSS/SRC cut does not invalidate route feasibility, so repeated
+        solves of the same node reuse the same Phase-II model and never rerun
+        Phase I.
+        """
+        if phaseTwoMaster is None:
+            phaseTwoMaster = self._newPersistentMaster(
+                phase=2,
+                branchingState=branchingState,
+                outputFlag=outputFlag,
+                timeLimit=self._remainingTime(),
+            )
+        else:
+            phaseTwoMaster.syncColumns(self.columns)
+            phaseTwoMaster.syncBssCuts(self.bssCuts)
+            phaseTwoMaster.syncSrcCuts(self.srcCuts)
+
+        totalPhaseOneIterations = 0
+        totalPhaseTwoIterations = 0
+
+        # First attempt the actual Phase-II restricted master.  If it is
+        # feasible, exact pricing is all that is needed and Phase I is skipped.
         remaining = self._remainingTime()
-        phaseOneIterations, status = self._solveCGPhase(
-            phase=1,
+        phaseTwoIterations, status = self._runPersistentCG(
+            master=phaseTwoMaster,
+            phase=2,
             outputFlag=outputFlag,
             branchingState=branchingState,
             timeLimit=remaining,
         )
-        self._lastNodePhaseOneIterations = phaseOneIterations
-        self.totalPhaseOneIterations += phaseOneIterations
-        if status != 'OPTIMAL':
-            self._lastNodePhaseTwoIterations = 0
-            return status, None
+        totalPhaseTwoIterations += phaseTwoIterations
 
-        artificial = self.master.getPhaseOneArtificialValue()
-        if artificial > self.phaseOneTolerance:
-            self._lastNodePhaseTwoIterations = 0
-            return 'INFEASIBLE', None
+        if status == 'INFEASIBLE':
+            self.phaseOneActivated += 1
+            self.profiler.increment('phaseOneActivated')
+            if outputFlag >= 2:
+                print('    [P1] restricted Phase-II RMP infeasible -> exact Phase I activated')
 
-        # Phase II alternates exact column generation and SRC separation.
-        # Once a cut is added, the master duals change, so pricing MUST be run
-        # again before the node LP can be declared solved.
-        totalPhaseTwoIterations = 0
-        srcRoundsThisNode = 0
-
-        while True:
+            phaseOneMaster = self._newPersistentMaster(
+                phase=1,
+                branchingState=branchingState,
+                outputFlag=outputFlag,
+                timeLimit=self._remainingTime(),
+            )
             remaining = self._remainingTime()
-            phaseTwoIterations, status = self._solveCGPhase(
+            phaseOneIterations, phaseOneStatus = self._runPersistentCG(
+                master=phaseOneMaster,
+                phase=1,
+                outputFlag=outputFlag,
+                branchingState=branchingState,
+                timeLimit=remaining,
+            )
+            totalPhaseOneIterations += phaseOneIterations
+
+            if phaseOneStatus != 'OPTIMAL':
+                self._lastNodePhaseOneIterations = totalPhaseOneIterations
+                self._lastNodePhaseTwoIterations = totalPhaseTwoIterations
+                self.totalPhaseOneIterations += totalPhaseOneIterations
+                self.totalPhaseTwoIterations += totalPhaseTwoIterations
+                self.master = phaseOneMaster
+                return phaseOneStatus, None, phaseTwoMaster
+
+            artificial = phaseOneMaster.getPhaseOneArtificialValue()
+            if artificial > self.phaseOneTolerance:
+                self._lastNodePhaseOneIterations = totalPhaseOneIterations
+                self._lastNodePhaseTwoIterations = totalPhaseTwoIterations
+                self.totalPhaseOneIterations += totalPhaseOneIterations
+                self.totalPhaseTwoIterations += totalPhaseTwoIterations
+                self.master = phaseOneMaster
+                return 'INFEASIBLE', None, phaseTwoMaster
+
+            # Phase I may have generated globally useful route columns.  Append
+            # them to the already-created Phase-II master, keeping its model
+            # object and all permanent rows intact.
+            phaseTwoMaster.syncColumns(self.columns)
+            phaseTwoMaster.syncBssCuts(self.bssCuts)
+            phaseTwoMaster.syncSrcCuts(self.srcCuts)
+
+            remaining = self._remainingTime()
+            extraIterations, status = self._runPersistentCG(
+                master=phaseTwoMaster,
                 phase=2,
                 outputFlag=outputFlag,
                 branchingState=branchingState,
                 timeLimit=remaining,
             )
-            totalPhaseTwoIterations += phaseTwoIterations
-            if status != 'OPTIMAL':
-                self._lastNodePhaseTwoIterations = totalPhaseTwoIterations
-                self.totalPhaseTwoIterations += totalPhaseTwoIterations
-                return status, None
+            totalPhaseTwoIterations += extraIterations
+        else:
+            self.phaseOneSkipped += 1
+            self.profiler.increment('phaseOneSkipped')
 
-            if (
-                not self._srcSeparationAllowed(nodeDepth)
-                or srcRoundsThisNode >= self.maxSrcRoundsPerNode
-            ):
-                break
+        if status != 'OPTIMAL':
+            self._lastNodePhaseOneIterations = totalPhaseOneIterations
+            self._lastNodePhaseTwoIterations = totalPhaseTwoIterations
+            self.totalPhaseOneIterations += totalPhaseOneIterations
+            self.totalPhaseTwoIterations += totalPhaseTwoIterations
+            self.master = phaseTwoMaster
+            return status, None, phaseTwoMaster
 
-            added, _ = self._separateSrcCuts(outputFlag=outputFlag)
+        # Phase II alternates exact column generation and optional SRC
+        # separation on the SAME persistent master. New SRC duals therefore
+        # trigger re-pricing without a model rebuild.
+        srcRoundsThisNode = 0
+        while (
+            self._srcSeparationAllowed(nodeDepth)
+            and srcRoundsThisNode < self.maxSrcRoundsPerNode
+        ):
+            with self.profiler.timeBlock('srcSeparation'):
+                added, _ = self._separateSrcCuts(outputFlag=outputFlag)
             self.srcSeparationRounds += 1
             srcRoundsThisNode += 1
             if added == 0:
                 break
 
+            phaseTwoMaster.syncSrcCuts(self.srcCuts)
+            remaining = self._remainingTime()
+            extraIterations, status = self._runPersistentCG(
+                master=phaseTwoMaster,
+                phase=2,
+                outputFlag=outputFlag,
+                branchingState=branchingState,
+                timeLimit=remaining,
+            )
+            totalPhaseTwoIterations += extraIterations
+            if status != 'OPTIMAL':
+                self._lastNodePhaseOneIterations = totalPhaseOneIterations
+                self._lastNodePhaseTwoIterations = totalPhaseTwoIterations
+                self.totalPhaseOneIterations += totalPhaseOneIterations
+                self.totalPhaseTwoIterations += totalPhaseTwoIterations
+                self.master = phaseTwoMaster
+                return status, None, phaseTwoMaster
+
+        self._lastNodePhaseOneIterations = totalPhaseOneIterations
         self._lastNodePhaseTwoIterations = totalPhaseTwoIterations
+        self.totalPhaseOneIterations += totalPhaseOneIterations
         self.totalPhaseTwoIterations += totalPhaseTwoIterations
-        return 'OPTIMAL', self.master.getTValue()
+        self.master = phaseTwoMaster
+        return 'OPTIMAL', phaseTwoMaster.getTValue(), phaseTwoMaster
 
     def _selectedIntegralEntries(self):
         return self.master.getSelectedLPColumns(
@@ -1158,11 +1375,49 @@ class BranchPriceCutSolver(RootColumnGenerationSolver):
             f"CG iterations P1/P2={result['phaseOneIterations']}/{result['phaseTwoIterations']}"
         )
         print(
-            f"Warm start    : +{result.get('warmStartColumnsAdded', 0)} columns | "
-            f"feasible starts={result.get('warmStartFeasibleStarts', 0)} | "
-            f"build={_format_number(result.get('warmStartBuildTime', 0.0), 3)}s | "
+            f"Warm start    : savings +{result.get('warmStartColumnsAdded', 0)} | "
+            f"short +{result.get('shortRouteColumnsAdded', 0)} | "
             f"dominance={result.get('dominanceMode', '-')}"
         )
+        print(
+            f"Phase I       : activated={result.get('phaseOneActivated', 0)} | "
+            f"skipped={result.get('phaseOneSkipped', 0)} | "
+            f"symmetric nodes skipped={result.get('symmetricNodesSkipped', 0)}"
+        )
+
+        profile = result.get('performanceProfile', {})
+        times = profile.get('times', {})
+        counts = profile.get('counts', {})
+        if times or counts:
+            print('-' * width)
+            print('PERFORMANCE PROFILE')
+            print('-' * width)
+            print(
+                f"Master        : build={_format_number(times.get('masterBuild', 0.0), 3)}s | "
+                f"LP optimize={_format_number(times.get('masterOptimize', 0.0), 3)}s | "
+                f"solves={counts.get('masterOptimizeCalls', 0)}"
+            )
+            print(
+                f"Pricing       : time={_format_number(times.get('pricing', 0.0), 3)}s | "
+                f"calls={counts.get('pricingCalls', 0)} | "
+                f"labels={counts.get('pricingGeneratedLabels', 0)} | "
+                f"domCmp={counts.get('pricingDominanceComparisons', 0)}"
+            )
+            print(
+                f"Route eval    : time={_format_number(times.get('routeEvaluation', 0.0), 3)}s | "
+                f"cacheHit={counts.get('routeEvaluationCacheHits', 0)} | "
+                f"cacheMiss={counts.get('routeEvaluationCacheMisses', 0)}"
+            )
+            print(
+                f"BSS           : total={_format_number(times.get('bssTotal', 0.0), 3)}s | "
+                f"MIP={_format_number(times.get('bssMipOptimize', 0.0), 3)}s | "
+                f"cacheHit={counts.get('bssCacheHits', 0)} | "
+                f"cacheMiss={counts.get('bssCacheMisses', 0)}"
+            )
+            if times.get('srcSeparation', 0.0) > 0.0:
+                print(
+                    f"SRC           : separation={_format_number(times.get('srcSeparation', 0.0), 3)}s"
+                )
 
         routes = result.get('routes', [])
         if routes:
@@ -1234,6 +1489,7 @@ class BranchPriceCutSolver(RootColumnGenerationSolver):
         """
         startWall = time.time()
         self._deadline = None if timeLimit is None else startWall + float(timeLimit)
+        self.profiler.reset()
 
         # Reset solve statistics so one solver object can safely be solved again.
         self.incumbentObjective = float('inf')
@@ -1262,6 +1518,7 @@ class BranchPriceCutSolver(RootColumnGenerationSolver):
 
         self._printStartBanner(outputFlag, nodeLimit, timeLimit)
         self._initializeWarmStart(outputFlag=outputFlag)
+        self._initializeShortRoutePool(outputFlag=outputFlag)
         self._initializeSavingsIncumbent(outputFlag=outputFlag)
 
         if self._timeExpired():
@@ -1280,6 +1537,7 @@ class BranchPriceCutSolver(RootColumnGenerationSolver):
         heapq.heappush(queue, root)
         self.nodesCreated = 1
         nextNodeId = 1
+        seenBranchStateKeys = {rootState.canonicalKey()} if self.deduplicateSymmetricNodes else set()
 
         while queue:
             if self._timeExpired():
@@ -1312,19 +1570,21 @@ class BranchPriceCutSolver(RootColumnGenerationSolver):
             if outputFlag:
                 self._printNodeHeader(node, len(queue))
 
-            # A newly discovered global BSS cut can change the same node LP,
-            # so an integral node can be re-priced several times before it is
-            # finally fathomed or branched.
+            # A newly discovered global BSS cut can change the same node LP.
+            # Keep one persistent Phase-II RMP for the entire lifetime of this
+            # active node, including BSS-cut and SRC re-pricing rounds.
+            phaseTwoMaster = None
             while True:
                 if self._timeExpired():
                     self._interrupted = True
                     self._interruptionStatus = 'TIME_LIMIT'
                     break
 
-                status, nodeLowerBound = self._solveNodeLP(
+                status, nodeLowerBound, phaseTwoMaster = self._solveNodeLP(
                     node.branchingState,
                     outputFlag=outputFlag,
                     nodeDepth=node.depth,
+                    phaseTwoMaster=phaseTwoMaster,
                 )
 
                 if status == 'INFEASIBLE':
@@ -1473,6 +1733,15 @@ class BranchPriceCutSolver(RootColumnGenerationSolver):
                         childDescriptions.append(f'f={value}:structurally infeasible')
                         continue
 
+                    if self.deduplicateSymmetricNodes:
+                        stateKey = childState.canonicalKey()
+                        if stateKey in seenBranchStateKeys:
+                            self.symmetricNodesSkipped += 1
+                            self.profiler.increment('symmetricNodesSkipped')
+                            childDescriptions.append(f'f={value}:symmetric duplicate')
+                            continue
+                        seenBranchStateKeys.add(stateKey)
+
                     child = _QueueNode(
                         estimatedLowerBound=float(nodeLowerBound),
                         nodeId=nextNodeId,
@@ -1585,6 +1854,14 @@ class BranchPriceCutSolver(RootColumnGenerationSolver):
             'branchCount': self.branchCount,
             'phaseOneIterations': self.totalPhaseOneIterations,
             'phaseTwoIterations': self.totalPhaseTwoIterations,
+            'phaseOneSkipped': self.phaseOneSkipped,
+            'phaseOneActivated': self.phaseOneActivated,
+            'symmetricNodesSkipped': self.symmetricNodesSkipped,
+            'shortRouteColumnsAdded': self.shortRouteColumnsAdded,
+            'shortRouteBuildTime': self.shortRouteBuildTime,
+            'performanceProfile': self.profiler.snapshot(),
+            'cacheStatistics': collectCacheStatistics(self.sequenceEvaluator, self.bssScheduler),
+            'pricingStatistics': getattr(self.pricing, 'lastStatistics', None),
             'selectedRouteTasks': [tuple(c.tasks) for c in self.incumbentColumns],
             'routes': routes,
             'selectedPhysicalRoutes': [tuple(route['nodes']) for route in routes],

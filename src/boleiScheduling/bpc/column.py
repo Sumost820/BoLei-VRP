@@ -18,6 +18,7 @@ class RouteColumn:
     duration: float
     baseNodes: Tuple[int, ...] = field(default_factory=tuple)
     baseSwapEvents: Tuple[tuple, ...] = field(default_factory=tuple)
+    _taskSetCache: frozenset = field(default=None, init=False, repr=False, compare=False)
 
     @property
     def signature(self):
@@ -25,7 +26,11 @@ class RouteColumn:
 
     @property
     def taskSet(self):
-        return frozenset(self.tasks)
+        # Cache the immutable customer set. This property is queried repeatedly
+        # in RMP construction, branching compatibility and cut separation.
+        if self._taskSetCache is None:
+            object.__setattr__(self, "_taskSetCache", frozenset(self.tasks))
+        return self._taskSetCache
 
     @property
     def isEmpty(self):

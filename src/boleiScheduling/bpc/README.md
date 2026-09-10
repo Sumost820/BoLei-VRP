@@ -1,87 +1,80 @@
-# BPC V0.5 — Savings warm start + strong exact dominance
+# BPC V0.15 — pricing performance refinement
 
-This version keeps the V0.4 exact arc-flow Branch-and-Price-and-Cut structure,
-but improves the two main bottlenecks before changing the mathematical model.
+This version keeps the same exact slot-specific arc-flow Branch-and-Price-and-Cut
+model and focuses on implementation overhead.
 
-## 1. Savings warm start
+## Main performance changes
 
-Before root column generation, a multi-start directed Clarke-Wright-style
-construction generates customer-only route sequences. Every proposed sequence
-is checked by the exact fixed-sequence swap DP, so the route is energy-feasible
-and receives its exact isolated minimum base duration.
+1. **Persistent RMP.** A node/phase LP is built once. New route columns are
+   appended through Gurobi `Column` objects; SRC/BSS rows are appended to the
+   same model. Re-optimization therefore reuses the previous LP basis instead
+   of rebuilding the full master every CG round.
 
-The warm-start merge score is
+2. **Phase-I on demand.** A branch node first solves the actual Phase-II
+   restricted master. Phase I is created only if that restricted master is
+   infeasible and new branch-compatible columns may be needed. Adding a BSS or
+   SRC cut never reruns Phase I.
 
-`excessRoutePenalty * max(0, numberRoutes-K) + baseMakespan + 1e-6*sumDuration`.
+3. **Batch pricing early stop.** Labeling stops as soon as the requested batch
+   of negative reduced-cost customer sequences has been found. Exact pricing is
+   fully exhausted only when no improving column is returned and optimality
+   must be certified.
 
-The huge excess-route penalty is used **only inside this heuristic warm start**.
-It never enters the restricted master, pricing reduced costs, node bounds, or
-optimality proof.
+4. **Mask-indexed exact dominance.** The rigorous
+   `visited(A) subseteq visited(B)` rule is unchanged, but labels are indexed by
+   exact visited bit masks and Pareto fronts. The implementation avoids scanning
+   every label in every cardinality bucket.
 
-The generated singleton/intermediate/final savings routes are inserted into the
-initial RMP column set. If a savings start reaches at most K routes, its isolated
-minimum swap placement is also scheduled by a fast feasible FCFS single-BSS
-scheduler to provide an immediate incumbent upper bound. This greedy BSS value
-is never used to create an optimality cut.
+5. **Predecessor labels.** Partial customer tuples are no longer copied on every
+   extension. A complete customer sequence is reconstructed only for a negative
+   complete route.
 
-Because a K-route warm-start solution already makes all Phase-I artificial
-variables zero, Phase I is then globally optimal at value zero. The code safely
-skips Phase-I pricing in that case.
+6. **Global caches.** Exact fixed-sequence evaluations and complete feasible
+   swap-plan families are cached. Proven-optimal BSS results are cached by a
+   permutation-invariant selected-route key. Non-optimal/time-limit BSS results
+   are never cached as exact values.
 
-## 2. Strong exact set-inclusion dominance
+7. **Small-instance short-route warm pool.** By default, when `N<=15`, all
+   feasible ordered routes of length at most 2 are pre-generated. This is only
+   an initial column pool and does not restrict pricing.
 
-For slot k, define the prefix reduced cost
+8. **Vehicle-symmetry node deduplication.** With homogeneous vehicles, branch
+   states that differ only by a permutation of vehicle slots are recognized as
+   the same subproblem and only one is kept. This can be disabled with
+   `deduplicateSymmetricNodes=False`.
 
-`g(L) = beta_k * duration(L) - sum_{i in visited(L)} pi_i`.
+9. **SRC default OFF.** SRC remains fully implemented and exact, but it is now
+   opt-in because for the small cases motivating this refactor the extra
+   cut-price rounds and parity state can cost more than the node reduction.
 
-For labels A and B with the same physical current node, same last customer in
-the compressed customer sequence, and same satisfied-required-arc mask, A
-dominates B if
+10. **Integrated profiling.** Final output reports master build/LP time,
+    pricing time and label counts, exact route-evaluation cache statistics, BSS
+    time/cache statistics, Phase-I activation/skips and symmetric nodes skipped.
 
-- `visited(A) subseteq visited(B)`,
-- `remainingEnergy(A) >= remainingEnergy(B)`,
-- `g(A) <= g(B)`.
+11. **FIFO label queue restored.** V0.14's binary heap is removed. Label
+    expansion again uses `collections.deque` O(1) push/pop; safe reduced-cost
+    pruning is applied before a new label enters the dominance structure.
 
-This dominance is exact. Every elementary suffix feasible from B avoids the
-larger visited(B), so it is also available to A. A starts that suffix from the
-same physical node with no less energy, and both labels receive the same suffix
-reduced-cost increment.
+12. **Staged vehicle-slot pricing.** Slots are tried in a promising deterministic
+    order. As soon as one slot yields improving columns in a batched CG round,
+    the solver returns them and immediately re-optimizes the persistent RMP
+    instead of pricing every remaining slot under stale duals.
 
-The old equal-visited-set rule remains available through
-`dominanceMode='equal'` for validation. The default is now
-`dominanceMode='subset'`.
+13. **Exact vehicle-slot dominance.** An exhaustively priced slot can certify a
+    second slot when its branch-feasible route set contains the second slot's
+    set and `beta_a <= beta_b`, `sigma_a >= sigma_b`. This can remove redundant
+    ESPPRC calls without changing pricing exactness.
 
-The dominance bucket key no longer contains the visited mask. Buckets are
-subdivided by `visitedMask.bit_count()` so only cardinalities that can possibly
-be subset/superset comparable are scanned.
+## Exactness
 
-## 3. Early branch propagation
+No heuristic replaces exact pricing. Savings and short-route generation only
+supply initial columns/incumbents. Mask-indexed dominance uses the same rigorous
+conditions as before. The BSS cache stores only results with
+`provenOptimal=True`. Therefore, without external node/time limits and with all
+required Gurobi subproblems solved to proven optimality, the algorithm retains
+the same exactness conditions as the previous BPC version.
 
-Required successor-arc branches are enforced before a new customer label is
-inserted:
-
-- if the previous customer has a required successor, no other successor is
-  allowed;
-- if the candidate customer has a required predecessor, no other predecessor is
-  allowed;
-- the same logic is applied to the final customer -> depot arc.
-
-This is exact and avoids creating labels that are already branch-infeasible.
-
-## Column / master / cuts / branching
-
-The V0.4 definitions are unchanged:
-
-- a column is an ordered customer sequence;
-- its `d_r` is the exact minimum isolated base duration over swap placements;
-- the master minimizes `T` with coverage, vehicle-slot, and slot makespan rows;
-- pricing uses `beta_k*d_r - sum_i pi_i - sigma_k`;
-- branch variable is the slot-specific compressed successor-arc flow;
-- every integral route combination is sent to the exact BSS subproblem;
-- a proven BSS optimum `T*` yields
-  `T >= T*(sum_{r in R*} sum_k x[k,r] - |R*| + 1)`.
-
-## Recommended exact run
+## Recommended small-instance configuration
 
 ```python
 from boleiScheduling.bpc import BranchPriceCutSolver
@@ -90,83 +83,25 @@ solver = BranchPriceCutSolver(
     data,
     pricingMode='labeling',
     dominanceMode='subset',
+    maxColumnsPerRound=100,
+
     useSavingsWarmStart=True,
-    savingsStarts=12,
-    savingsSeed=1,
-    savingsRandomization=0.20,
-    savingsExcessRoutePenalty=1e9,
-    maxWarmStartColumns=1000,
     useSavingsIncumbent=True,
-    maxColumnsPerRound=50,
+
+    # Fast initial pool for small cases.
+    preGenerateShortRoutes=2,
+    shortRouteTaskThreshold=15,
+    maxShortRouteColumns=1000,
+
+    # Usually faster for N≈10–15; SRC can be enabled explicitly later.
+    useSRC=False,
+
+    deduplicateSymmetricNodes=True,
     maxExactRouteTasks=None,
     bssTimeLimit=None,
 )
 solver.solve(outputFlag=2, nodeLimit=None, timeLimit=None)
 ```
 
-For an exact optimality proof, do not impose a node/cut/route-plan truncation and
-require every BSS subproblem used for separation to be solved to proven
-optimality.
-
-
-## Tree search: best-bound
-
-The Branch-and-Price-and-Cut tree uses a min-heap and always processes the open
-node with the smallest inherited valid LP lower bound. The node id is used only
-as a deterministic tie-break. This restores the pre-V0.6 search order.
-
-Best-bound does not change the branching disjunction, pricing problem, SRCs, BSS
-optimality cuts, or exactness. Its main practical advantage here is that the
-global lower bound and reported optimality gap tend to evolve more steadily than
-under DFS.
-
-## V0.7: 3-row subset-row cuts (SRC)
-
-V0.7 adds the classical rank-1 subset-row cut family to reduce the branch tree.
-For every customer triple `S={i,j,h}` the globally valid inequality is
-
-```
-sum_{k,r} floor(|S intersect r| / 2) x[k,r] <= 1.
-```
-
-For a triple, a route coefficient is therefore one iff the route contains at
-least two members of the triple.  SRC separation is performed only after the
-current node has been solved by exact column generation.  Whenever an SRC is
-added, the node is solved and priced again because the RMP dual solution has
-changed.
-
-The pricing reduced cost becomes
-
-```
-rc(k,r) = beta_k d_r - sum_{i in r} pi_i - sigma_k
-          - sum_S eta_S floor(|S intersect r|/2),
-```
-
-where `eta_S <= 0` is the Gurobi dual of an SRC `<=` row.  Equivalently,
-`rho_S=-eta_S>=0` is an additive pricing penalty.
-
-The labeling algorithm handles this term exactly.  For divisor-2 SRCs, each
-active nonzero-dual cut needs only one parity bit.  Visiting a member of S
-changes the count parity; when the old parity is odd, `floor(count/2)` increases
-by one and `rho_S` is added to the partial reduced cost.  Dominance requires the
-same SRC parity vector in addition to the existing physical/branch state.  This
-keeps the subset-visited-set dominance rigorous under SRC duals.
-
-Default BPC V0.7 SRC parameters:
-
-```python
-solver = BranchPriceCutSolver(
-    data,
-    useSRC=True,
-    srcViolationTolerance=1e-7,
-    maxSrcCutsPerRound=10,
-    maxSrcRoundsPerNode=5,
-    maxTotalSrcCuts=100,
-    srcMaxDepth=2,
-)
-```
-
-These parameters control cut separation effort only.  SRCs are strengthening
-cuts and are not required for correctness, so limiting the number of rounds,
-total cuts, or separation depth does not compromise the exactness of the BPC
-algorithm; it only changes performance.
+Set `outputFlag=1` for concise progress, `2` for detailed CG/profile/BSS output,
+and `3` to additionally show native Gurobi logs.

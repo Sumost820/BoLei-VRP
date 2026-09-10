@@ -1,6 +1,5 @@
 from dataclasses import dataclass
 import copy
-import itertools
 
 
 @dataclass
@@ -15,31 +14,98 @@ class BssScheduleResult:
 
 
 class ExactBssScheduler:
-    """
-    Exact BSS subproblem for a FIXED set of customer-route sequences.
+    """Exact single-BSS subproblem with a permutation-invariant result cache.
 
-    For each route sequence, ALL feasible swap placements are enumerated.
-    Gurobi then simultaneously chooses one placement per route and sequences
-    all chosen swap events on the single physical BSS to minimize makespan.
-
-    This is exact for the fixed route combination, subject only to Gurobi being
-    solved to proven optimality. No route-level variant truncation is used.
+    The cache key is the sorted tuple of selected nonempty customer-sequence
+    signatures.  A cached result is stored in that canonical route order and is
+    remapped back to the caller's route order before returning.  Only proven
+    optimal results are cached; a time-limit incumbent is never reused as an
+    exact BSS cut value.
     """
 
-    def __init__(self, modelData, sequenceEvaluator, maxExactRouteTasks=None):
+    def __init__(
+        self,
+        modelData,
+        sequenceEvaluator,
+        maxExactRouteTasks=None,
+        profiler=None,
+    ):
         self.data = modelData
         self.sequenceEvaluator = sequenceEvaluator
         self.maxExactRouteTasks = maxExactRouteTasks
+        self.profiler = profiler
+        self._cache = {}
+        self._statistics = {
+            'calls': 0,
+            'cacheHits': 0,
+            'cacheMisses': 0,
+            'provenOptimalCached': 0,
+        }
+
+    def _profileIncrement(self, name, amount=1):
+        if self.profiler is not None:
+            self.profiler.increment(name, amount)
+
+    def getCacheStatistics(self):
+        result = dict(self._statistics)
+        result['entries'] = len(self._cache)
+        return result
+
+    def clearCache(self):
+        self._cache.clear()
+
+    def _canonicalize(self, columns):
+        nonempty = [col for col in columns if not col.isEmpty]
+        indexed = list(enumerate(nonempty))
+        indexed.sort(key=lambda pair: tuple(pair[1].signature))
+        canonicalColumns = [col for _, col in indexed]
+        canonicalToOriginal = {
+            canonicalIndex: originalIndex
+            for canonicalIndex, (originalIndex, _) in enumerate(indexed)
+        }
+        key = tuple(tuple(col.signature) for col in canonicalColumns)
+        return key, canonicalColumns, canonicalToOriginal
+
+    @staticmethod
+    def _remapResult(result, canonicalToOriginal):
+        if not canonicalToOriginal:
+            return copy.deepcopy(result)
+
+        selected = {
+            canonicalToOriginal[r]: v
+            for r, v in result.selectedPlanIndexByRoute.items()
+        }
+        completion = {
+            canonicalToOriginal[r]: value
+            for r, value in result.routeCompletion.items()
+        }
+        waiting = {
+            canonicalToOriginal[r]: value
+            for r, value in result.routeWaiting.items()
+        }
+        events = []
+        for raw in result.events:
+            event = dict(raw)
+            event['routeIndex'] = canonicalToOriginal[event['routeIndex']]
+            events.append(event)
+        events.sort(key=lambda event: (event['startTime'], event['routeIndex']))
+
+        return BssScheduleResult(
+            objective=float(result.objective),
+            status=result.status,
+            provenOptimal=bool(result.provenOptimal),
+            selectedPlanIndexByRoute=selected,
+            routeCompletion=completion,
+            routeWaiting=waiting,
+            events=events,
+        )
 
     def solve(self, columns, outputFlag=0, timeLimit=None, mipGap=0.0):
-        try:
-            import gurobipy as gp
-            from gurobipy import GRB
-        except ImportError as error:
-            raise ImportError('ExactBssScheduler requires gurobipy') from error
+        self._statistics['calls'] += 1
+        self._profileIncrement('bssCalls')
 
-        nonempty = [column for column in columns if not column.isEmpty]
-        if not nonempty:
+        key, canonicalColumns, canonicalToOriginal = self._canonicalize(columns)
+        if not canonicalColumns:
             return BssScheduleResult(
                 objective=0.0,
                 status='OPTIMAL',
@@ -49,6 +115,45 @@ class ExactBssScheduler:
                 routeWaiting={},
                 events=[],
             )
+
+        cached = self._cache.get(key)
+        if cached is not None:
+            self._statistics['cacheHits'] += 1
+            self._profileIncrement('bssCacheHits')
+            return self._remapResult(cached, canonicalToOriginal)
+
+        self._statistics['cacheMisses'] += 1
+        self._profileIncrement('bssCacheMisses')
+
+        if self.profiler is None:
+            canonicalResult = self._solveCanonical(
+                canonicalColumns,
+                outputFlag=outputFlag,
+                timeLimit=timeLimit,
+                mipGap=mipGap,
+            )
+        else:
+            with self.profiler.timeBlock('bssTotal'):
+                canonicalResult = self._solveCanonical(
+                    canonicalColumns,
+                    outputFlag=outputFlag,
+                    timeLimit=timeLimit,
+                    mipGap=mipGap,
+                )
+
+        if canonicalResult.provenOptimal:
+            self._cache[key] = copy.deepcopy(canonicalResult)
+            self._statistics['provenOptimalCached'] += 1
+            self._profileIncrement('bssOptimalResultsCached')
+
+        return self._remapResult(canonicalResult, canonicalToOriginal)
+
+    def _solveCanonical(self, nonempty, outputFlag=0, timeLimit=None, mipGap=0.0):
+        try:
+            import gurobipy as gp
+            from gurobipy import GRB
+        except ImportError as error:
+            raise ImportError('ExactBssScheduler requires gurobipy') from error
 
         allPlans = {}
         for r, column in enumerate(nonempty):
@@ -102,8 +207,6 @@ class ExactBssScheduler:
             2.0 * maxRouteDuration + (totalPotentialEvents + 1) * swapTime + 100.0,
         )
 
-        # Activate the selected plan, preserve within-route chronology, and
-        # link the last selected event to T.
         for r, plans in allPlans.items():
             for v, plan in enumerate(plans):
                 active = y[r, v]
@@ -122,8 +225,6 @@ class ExactBssScheduler:
                 )
 
                 for h in range(len(plan.swapEvents)):
-                    # Inactive events are forced to zero; active events are
-                    # bounded by the global horizon big-M.
                     model.addConstr(
                         s[r, v, h] <= bigM * active,
                         name=f'activateStart_{r}_{v}_{h}',
@@ -145,8 +246,6 @@ class ExactBssScheduler:
                     name=f'complete_{r}_{v}',
                 )
 
-        # One physical BSS. Events belonging to different route sequences must
-        # be disjunctively ordered when both corresponding plans are selected.
         orderCounter = 0
         for idx, firstKey in enumerate(eventKeys):
             r1, v1, h1 = firstKey
@@ -175,7 +274,12 @@ class ExactBssScheduler:
                 orderCounter += 1
 
         model.setObjective(T, GRB.MINIMIZE)
-        model.optimize()
+
+        if self.profiler is None:
+            model.optimize()
+        else:
+            with self.profiler.timeBlock('bssMipOptimize'):
+                model.optimize()
 
         if model.SolCount == 0:
             return BssScheduleResult(
@@ -236,7 +340,6 @@ class ExactBssScheduler:
             routeCompletion[r] = float(plan.duration + totalWaiting)
 
         events.sort(key=lambda event: (event['startTime'], event['routeIndex']))
-
         return BssScheduleResult(
             objective=objective,
             status='OPTIMAL' if provenOptimal else f'GUROBI_STATUS_{model.Status}',

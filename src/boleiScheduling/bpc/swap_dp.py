@@ -6,43 +6,66 @@ class ExactFixedSequenceEvaluator:
     """
     Exact isolated-route evaluator for a FIXED customer order.
 
-    It minimizes base duration over all feasible swap positions. Because every
-    state at a swap boundary has the same full battery Q, keeping only the
-    minimum-duration predecessor for a fixed customer prefix is exact for the
-    minimum base-duration problem.
-
-    Base duration includes travel, customer service, BSS detour and fixed swap
-    times, but excludes waiting caused by other vehicles at the shared BSS.
+    Both the isolated optimum and the complete feasible swap-plan family are
+    cached globally for the lifetime of the solver.  This is important in a
+    branch-and-price tree: the same customer sequence is routinely encountered
+    by savings, pricing, multiple branch nodes and the BSS subproblem.
     """
 
-    def __init__(self, modelData):
+    def __init__(self, modelData, profiler=None):
         self.data = modelData
         self.optimizer = FixedRouteSwapOptimizer(modelData, maxVariants=1)
         self.cache = {}
         self.nextColumnId = 1
+        self.profiler = profiler
+        self._statistics = {
+            'evaluateCalls': 0,
+            'evaluateHits': 0,
+            'evaluateMisses': 0,
+            'allPlansCalls': 0,
+            'allPlansHits': 0,
+            'allPlansMisses': 0,
+        }
 
+    def _profileIncrement(self, name, amount=1):
+        if self.profiler is not None:
+            self.profiler.increment(name, amount)
 
     def enumerateAllFeasiblePlans(self, taskSequence):
-        """
-        Enumerate EVERY feasible swap placement for a fixed customer order.
+        """Enumerate every feasible swap placement for a fixed customer order.
 
-        Swap positions are subsets of {1,...,m}, where position j means that
-        the vehicle visits the physical BSS immediately after customer j. A
-        swap after the last task is retained because it can be necessary when
-        the direct last-customer -> depot arc violates the battery lower bound.
-
-        This method is exponential and is used only by the exact small-instance
-        BSS reference solver in BPC V0.2. No maxVariants truncation is applied.
+        The cached plan objects are treated as read-only by the BPC code.  A
+        shallow list copy is returned, avoiding the former deep route copies on
+        every cache hit while preventing callers from mutating the cached list
+        container itself.
         """
         sequence = tuple(taskSequence)
         cacheKey = ('ALL_PLANS', sequence)
+        self._statistics['allPlansCalls'] += 1
+        self._profileIncrement('allPlanCalls')
+
         if cacheKey in self.cache:
-            return [route.copyWithId(route.routeId) for route in self.cache[cacheKey]]
+            self._statistics['allPlansHits'] += 1
+            self._profileIncrement('allPlanCacheHits')
+            return list(self.cache[cacheKey])
+
+        self._statistics['allPlansMisses'] += 1
+        self._profileIncrement('allPlanCacheMisses')
 
         if len(sequence) == 0:
-            self.cache[cacheKey] = []
+            self.cache[cacheKey] = tuple()
             return []
 
+        if self.profiler is None:
+            plans = self._enumeratePlansUncached(sequence)
+        else:
+            with self.profiler.timeBlock('allPlanEnumeration'):
+                plans = self._enumeratePlansUncached(sequence)
+
+        self.cache[cacheKey] = tuple(plans)
+        return list(plans)
+
+    def _enumeratePlansUncached(self, sequence):
         plans = []
         m = len(sequence)
         for mask in range(1 << m):
@@ -63,17 +86,23 @@ class ExactFixedSequenceEvaluator:
             if incumbent is None or route.duration < incumbent.duration:
                 bestBySignature[signature] = route
 
-        plans = sorted(
+        return sorted(
             bestBySignature.values(),
             key=lambda route: (route.duration, route.swapCount, tuple(route.nodes)),
         )
-        self.cache[cacheKey] = [route.copyWithId(route.routeId) for route in plans]
-        return [route.copyWithId(route.routeId) for route in plans]
 
     def evaluate(self, taskSequence):
         sequence = tuple(taskSequence)
+        self._statistics['evaluateCalls'] += 1
+        self._profileIncrement('routeEvaluationCalls')
+
         if sequence in self.cache:
+            self._statistics['evaluateHits'] += 1
+            self._profileIncrement('routeEvaluationCacheHits')
             return self.cache[sequence]
+
+        self._statistics['evaluateMisses'] += 1
+        self._profileIncrement('routeEvaluationCacheMisses')
 
         if len(sequence) == 0:
             column = RouteColumn(
@@ -86,7 +115,12 @@ class ExactFixedSequenceEvaluator:
             self.cache[sequence] = column
             return column
 
-        routes = self.optimizer.optimize(sequence, maxVariants=1)
+        if self.profiler is None:
+            routes = self.optimizer.optimize(sequence, maxVariants=1)
+        else:
+            with self.profiler.timeBlock('routeEvaluation'):
+                routes = self.optimizer.optimize(sequence, maxVariants=1)
+
         if not routes:
             self.cache[sequence] = None
             return None
@@ -113,3 +147,8 @@ class ExactFixedSequenceEvaluator:
         self.nextColumnId += 1
         self.cache[sequence] = column
         return column
+
+    def getCacheStatistics(self):
+        result = dict(self._statistics)
+        result['entries'] = len(self.cache)
+        return result

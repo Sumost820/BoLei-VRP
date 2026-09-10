@@ -293,3 +293,369 @@ class RestrictedMasterProblem:
                     if includeEmpty or not column.isEmpty:
                         result.append((k, r, column))
         return result
+
+
+class PersistentRestrictedMasterProblem:
+    """Incremental LP restricted master used by column generation.
+
+    One instance is tied to one branch node and one phase.  The Gurobi model is
+    built once; route columns and global cuts are appended incrementally.  This
+    preserves the LP basis between CG iterations and avoids rebuilding the full
+    constraint matrix after every pricing call.
+
+    ``RestrictedMasterProblem`` above is intentionally kept for the small
+    binary restricted-master reference and backwards compatibility.
+    """
+
+    def __init__(
+        self,
+        modelData,
+        columns,
+        phase=2,
+        bssCuts=None,
+        srcCuts=None,
+        branchingState=None,
+        outputFlag=0,
+        timeLimit=None,
+        profiler=None,
+        useDualSimplex=True,
+    ):
+        if phase not in (1, 2):
+            raise ValueError('phase must be 1 or 2')
+        self.data = modelData
+        self.phase = phase
+        self.branchingState = branchingState
+        self.profiler = profiler
+        self.useDualSimplex = bool(useDualSimplex)
+
+        self.columns = []
+        self.signatureToIndex = {}
+        self.x = {}
+        self.T = None
+        self.artificial = None
+        self.coverageConstr = {}
+        self.slotConstr = {}
+        self.makespanConstr = {}
+        self.bssCutConstr = {}
+        self.srcCutConstr = {}
+        self._bssCutByKey = {}
+        self._srcCutByKey = {}
+        self.model = None
+        self.buildTime = 0.0
+        self.optimizeTime = 0.0
+        self.optimizeCount = 0
+
+        import time as _time
+        start = _time.perf_counter()
+        self._buildEmptyModel(outputFlag=outputFlag, timeLimit=timeLimit)
+        if phase == 2:
+            self.syncBssCuts(bssCuts or ())
+            self.syncSrcCuts(srcCuts or ())
+        self.addColumns(columns)
+        self.buildTime = _time.perf_counter() - start
+        if self.profiler is not None:
+            self.profiler.addTime('masterBuild', self.buildTime)
+            self.profiler.increment('persistentMasterBuilds')
+
+    def _importGurobi(self):
+        try:
+            import gurobipy as gp
+            from gurobipy import GRB
+        except ImportError as error:
+            raise ImportError('PersistentRestrictedMasterProblem requires gurobipy') from error
+        return gp, GRB
+
+    def _buildEmptyModel(self, outputFlag=0, timeLimit=None):
+        gp, GRB = self._importGurobi()
+        model = gp.Model(f'BPC_Persistent_RMP_Phase{self.phase}')
+        model.Params.OutputFlag = int(outputFlag)
+        if self.useDualSimplex:
+            # Column generation repeatedly appends variables to an LP. Dual
+            # simplex generally reuses the previous basis very efficiently.
+            model.Params.Method = 1
+        if timeLimit is not None:
+            model.Params.TimeLimit = max(0.001, float(timeLimit))
+
+        self.T = model.addVar(lb=0.0, vtype=GRB.CONTINUOUS, name='T')
+
+        if self.phase == 1:
+            self.artificial = model.addVars(
+                self.data.C,
+                lb=0.0,
+                vtype=GRB.CONTINUOUS,
+                name='u',
+            )
+
+        # Create all permanent core rows before route variables. New route
+        # variables can then be appended with a Gurobi Column object.
+        for task in self.data.C:
+            if self.phase == 1:
+                lhs = self.artificial[task]
+            else:
+                lhs = gp.LinExpr()
+            self.coverageConstr[task] = model.addConstr(
+                lhs == 1.0,
+                name=f'cover_{task}',
+            )
+
+        for k in range(self.data.K):
+            self.slotConstr[k] = model.addConstr(
+                gp.LinExpr() == 1.0,
+                name=f'slot_{k}',
+            )
+            self.makespanConstr[k] = model.addConstr(
+                self.T >= 0.0,
+                name=f'makespan_{k}',
+            )
+
+        if self.phase == 1:
+            model.setObjective(
+                gp.quicksum(self.artificial[i] for i in self.data.C),
+                GRB.MINIMIZE,
+            )
+        else:
+            model.setObjective(self.T, GRB.MINIMIZE)
+
+        model.update()
+        self.model = model
+
+    def _isCompatible(self, slot, column):
+        if self.branchingState is None:
+            return True
+        return self.branchingState.isColumnCompatible(
+            slot,
+            column,
+            self.data.startNode,
+            self.data.endNode,
+        )
+
+    def _columnForRouteVariable(self, slot, routeColumn):
+        gp, _ = self._importGurobi()
+        coefficients = []
+        constraints = []
+
+        for task in routeColumn.taskSet:
+            constr = self.coverageConstr.get(task)
+            if constr is not None:
+                coefficients.append(1.0)
+                constraints.append(constr)
+
+        coefficients.append(1.0)
+        constraints.append(self.slotConstr[slot])
+
+        coefficients.append(-float(routeColumn.duration))
+        constraints.append(self.makespanConstr[slot])
+
+        if self.phase == 2:
+            signature = routeColumn.signature
+            for key, cut in self._bssCutByKey.items():
+                if signature in cut.routeSignatures:
+                    coefficients.append(-float(cut.value))
+                    constraints.append(self.bssCutConstr[key])
+
+            for key, cut in self._srcCutByKey.items():
+                coefficient = cut.coefficient(routeColumn)
+                if coefficient:
+                    coefficients.append(float(coefficient))
+                    constraints.append(self.srcCutConstr[key])
+
+        return gp.Column(coefficients, constraints)
+
+    def addColumn(self, routeColumn):
+        signature = tuple(routeColumn.signature)
+        previous = self.signatureToIndex.get(signature)
+        if previous is not None:
+            return False, previous
+
+        _, GRB = self._importGurobi()
+        routeIndex = len(self.columns)
+        self.columns.append(routeColumn)
+        self.signatureToIndex[signature] = routeIndex
+
+        for k in range(self.data.K):
+            column = self._columnForRouteVariable(k, routeColumn)
+            ub = 1.0 if self._isCompatible(k, routeColumn) else 0.0
+            var = self.model.addVar(
+                lb=0.0,
+                ub=ub,
+                obj=0.0,
+                vtype=GRB.CONTINUOUS,
+                name=f'x_{k}_{routeIndex}',
+                column=column,
+            )
+            self.x[k, routeIndex] = var
+
+        if self.profiler is not None:
+            self.profiler.increment('masterColumnsAdded')
+        return True, routeIndex
+
+    def addColumns(self, routeColumns):
+        added = 0
+        for routeColumn in routeColumns:
+            wasAdded, _ = self.addColumn(routeColumn)
+            if wasAdded:
+                added += 1
+        if added:
+            self.model.update()
+        return added
+
+    def syncColumns(self, globalColumns):
+        if len(globalColumns) <= len(self.columns):
+            return 0
+        return self.addColumns(globalColumns[len(self.columns):])
+
+    def _buildBssCutConstraint(self, cut):
+        gp, _ = self._importGurobi()
+        selection = gp.LinExpr()
+        signatures = set(cut.routeSignatures)
+        for r, routeColumn in enumerate(self.columns):
+            if routeColumn.signature not in signatures:
+                continue
+            for k in range(self.data.K):
+                selection += self.x[k, r]
+        # T - value*selection >= value*(1-|R*|)
+        return self.model.addConstr(
+            self.T - float(cut.value) * selection
+            >= float(cut.value) * (1 - len(cut.routeSignatures)),
+            name=f'bssCut_{len(self.bssCutConstr)}',
+        )
+
+    def addOrStrengthenBssCut(self, cut):
+        if self.phase != 2:
+            return False
+        key = cut.key
+        old = self._bssCutByKey.get(key)
+        if old is not None and old.value >= cut.value - 1e-12:
+            return False
+
+        if old is not None:
+            oldConstr = self.bssCutConstr.pop(key, None)
+            if oldConstr is not None:
+                self.model.remove(oldConstr)
+                self.model.update()
+
+        self._bssCutByKey[key] = cut
+        self.bssCutConstr[key] = self._buildBssCutConstraint(cut)
+        self.model.update()
+        if self.profiler is not None:
+            self.profiler.increment('masterBssCutsAdded')
+        return True
+
+    def syncBssCuts(self, cuts):
+        changed = 0
+        for cut in cuts:
+            if self.addOrStrengthenBssCut(cut):
+                changed += 1
+        return changed
+
+    def addSrcCut(self, cut):
+        if self.phase != 2:
+            return False
+        key = cut.key
+        if key in self._srcCutByKey:
+            return False
+
+        gp, _ = self._importGurobi()
+        lhs = gp.LinExpr()
+        for r, routeColumn in enumerate(self.columns):
+            coefficient = cut.coefficient(routeColumn)
+            if coefficient <= 0:
+                continue
+            for k in range(self.data.K):
+                lhs += float(coefficient) * self.x[k, r]
+
+        self._srcCutByKey[key] = cut
+        self.srcCutConstr[key] = self.model.addConstr(
+            lhs <= float(cut.rhs),
+            name=f'src_{len(self.srcCutConstr)}',
+        )
+        self.model.update()
+        if self.profiler is not None:
+            self.profiler.increment('masterSrcCutsAdded')
+        return True
+
+    def syncSrcCuts(self, cuts):
+        changed = 0
+        for cut in cuts:
+            if self.addSrcCut(cut):
+                changed += 1
+        return changed
+
+    def optimize(self, timeLimit=None):
+        import time as _time
+        _, GRB = self._importGurobi()
+        if timeLimit is None:
+            self.model.Params.TimeLimit = GRB.INFINITY
+        else:
+            self.model.Params.TimeLimit = max(0.001, float(timeLimit))
+
+        start = _time.perf_counter()
+        self.model.optimize()
+        elapsed = _time.perf_counter() - start
+        self.optimizeTime += elapsed
+        self.optimizeCount += 1
+        if self.profiler is not None:
+            self.profiler.addTime('masterOptimize', elapsed)
+            self.profiler.increment('masterOptimizeCalls')
+        return self.model
+
+    # Compatibility alias used by solver code.
+    solve = optimize
+
+    def getDuals(self):
+        if self.model is None or self.model.SolCount == 0:
+            raise RuntimeError('RMP has not been solved')
+        coverage = {i: self.coverageConstr[i].Pi for i in self.data.C}
+        slot = {k: self.slotConstr[k].Pi for k in range(self.data.K)}
+        makespan = {k: self.makespanConstr[k].Pi for k in range(self.data.K)}
+        src = {
+            self._srcCutByKey[key]: constr.Pi
+            for key, constr in self.srcCutConstr.items()
+        }
+        return MasterDuals(
+            coverage=coverage,
+            slot=slot,
+            makespan=makespan,
+            src=src,
+        )
+
+    def getPhaseOneArtificialValue(self):
+        if self.phase != 1:
+            raise RuntimeError('RMP is not in Phase I')
+        return sum(self.artificial[i].X for i in self.data.C)
+
+    def getObjectiveValue(self):
+        if self.model is None or self.model.SolCount == 0:
+            return float('inf')
+        return float(self.model.ObjVal)
+
+    def getTValue(self):
+        if self.model is None or self.model.SolCount == 0:
+            return float('inf')
+        return float(self.T.X)
+
+    def getPositiveX(self, tolerance=1e-8):
+        result = []
+        for k in range(self.data.K):
+            for r, routeColumn in enumerate(self.columns):
+                value = float(self.x[k, r].X)
+                if value > tolerance:
+                    result.append((k, r, routeColumn, value))
+        return result
+
+    def getSelectedLPColumns(self, tolerance=1e-7, includeEmpty=False):
+        result = []
+        for k in range(self.data.K):
+            selected = [
+                (r, routeColumn, float(self.x[k, r].X))
+                for r, routeColumn in enumerate(self.columns)
+                if self.x[k, r].X >= 1.0 - tolerance
+            ]
+            if len(selected) != 1:
+                raise RuntimeError(
+                    f'slot {k} is not integral: selected-at-one={selected}'
+                )
+            r, routeColumn, value = selected[0]
+            if includeEmpty or not routeColumn.isEmpty:
+                result.append((k, r, routeColumn, value))
+        return result
