@@ -42,7 +42,7 @@ def printRoutes(routes, scheduler, data):
 
 def testSolvePathBasedInstance():
     # mock数据
-    data = createMockData(taskCount=12, stationCopyCount=2, K=2, seed=4, Q=50, QMin=20)
+    data = createMockData(taskCount=12, stationCopyCount=2, K=3, seed=4, Q=50, QMin=20)
     # 求解模型
     scheduler = PathBasedGurobiScheduler(data)
     model = scheduler.solveModel(timeLimit=600, mipGap=0.001, outputFlag=1)
