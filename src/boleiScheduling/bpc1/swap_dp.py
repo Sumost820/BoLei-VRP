@@ -1,4 +1,4 @@
-from ..routePoolHeuristic.fixedRouteSwapOptimizer import FixedRouteSwapOptimizer
+from ..GeneratorAndAssemblerHeuristic.fixedRouteSwapOptimizer import FixedRouteSwapOptimizer
 from .column import RouteColumn, SwapEvent
 
 

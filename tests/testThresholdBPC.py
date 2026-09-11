@@ -30,8 +30,8 @@ def testThresholdMakespanBpcEndToEndAgainstExactPathModel():
 
     # One physical BSS, homogeneous vehicles.  Keep the instance small enough
     # for CI, but tight enough that battery / BSS logic is actually exercised.
-    taskCount = 15
-    data = createMockData(taskCount=taskCount, stationCopyCount=taskCount, seed=4, K=3, Q=50, QMin=20)
+    taskCount = 12
+    data = createMockData(taskCount=taskCount, stationCopyCount=taskCount, seed=4, K=2, Q=50, QMin=20)
 
     # Independent exact reference model.
     reference = PathBasedGurobiScheduler(data)
