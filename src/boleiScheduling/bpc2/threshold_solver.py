@@ -18,6 +18,7 @@ from .threshold_master import (
     ThresholdBssNoGoodCut,
     ThresholdRestrictedMasterProblem,
 )
+from .threshold_cuts import ThresholdThreeRowSrcSeparator
 from .threshold_pricing import (
     ExactThresholdLabelingPricing,
     HeuristicThresholdPricing,
@@ -63,6 +64,8 @@ class ThresholdFeasibilityResult:
     masterOptimizeCalls: int = 0
     srcCuts: int = 0
     totalCuts: int = 0
+    srcSeparationTime: float = 0.0
+    srcSeparationCalls: int = 0
 
 
 @dataclass
@@ -94,6 +97,8 @@ class ThresholdMakespanResult:
     bssCuts: int = 0
     srcCuts: int = 0
     totalCuts: int = 0
+    srcSeparationTime: float = 0.0
+    srcSeparationCalls: int = 0
 
 
 class ThresholdFeasibilityBpcSolver:
@@ -120,6 +125,11 @@ class ThresholdFeasibilityBpcSolver:
         phaseOneTolerance=1e-8,
         integralityTolerance=1e-7,
         bssTolerance=1e-7,
+        useSrcCuts=False,
+        srcRootOnly=True,
+        srcViolationTolerance=1e-7,
+        maxSrcCutsPerRound=5,
+        maxSrcCutsPerThreshold=20,
         maxNodes=None,
         timeLimit=None,
         bssTimeLimit=None,
@@ -153,6 +163,17 @@ class ThresholdFeasibilityBpcSolver:
         self.brancher = ThresholdArcFlowBrancher(
             modelData, integralityTolerance=integralityTolerance
         )
+        self.useSrcCuts = bool(useSrcCuts)
+        self.srcRootOnly = bool(srcRootOnly)
+        self.maxSrcCutsPerThreshold = (
+            None if maxSrcCutsPerThreshold is None
+            else max(0, int(maxSrcCutsPerThreshold))
+        )
+        self.srcSeparator = ThresholdThreeRowSrcSeparator(
+            modelData,
+            violationTolerance=srcViolationTolerance,
+            maxCutsPerRound=maxSrcCutsPerRound,
+        )
         self.maxColumnsPerRound = int(maxColumnsPerRound)
         self.useHeuristicPricing = bool(useHeuristicPricing)
         self.maxHeuristicColumnsPerRound = (
@@ -184,6 +205,8 @@ class ThresholdFeasibilityBpcSolver:
         self._exactPricingTime = 0.0
         self._bssSchedulingTime = 0.0
         self._srcCutCount = 0
+        self._srcSeparationTime = 0.0
+        self._srcSeparationCalls = 0
         self._activeOutputFlag = 0
 
     def _remainingTime(self, started):
@@ -406,10 +429,13 @@ class ThresholdFeasibilityBpcSolver:
         self._heuristicPricingTime = 0.0
         self._exactPricingTime = 0.0
         self._bssSchedulingTime = 0.0
+        self._srcSeparationTime = 0.0
+        self._srcSeparationCalls = 0
 
         bssCuts = []
         bssCutKeys = set()
         srcCuts = list(srcCuts or ())
+        srcCutKeys = {cut.key for cut in srcCuts}
         self._srcCutCount = len(srcCuts)
         queue = []
         serial = 0
@@ -479,6 +505,52 @@ class ThresholdFeasibilityBpcSolver:
                 # already strictly larger than K, this branch cannot be feasible.
                 if lb > self.data.K + self.integralityTolerance:
                     break
+
+                # ----------------------------------------------------------
+                # Three-row subset-row cut separation.  We only separate on
+                # a fully priced Phase-II LP, because adding an SRC changes
+                # the dual vector and therefore invalidates the previous
+                # pricing certificate.  If a cut is added, rebuild and re-price
+                # the same branch node under the strengthened master.
+                # ----------------------------------------------------------
+                canSeparateSrc = (
+                    self.useSrcCuts
+                    and (not self.srcRootOnly or node.depth == 0)
+                    and (
+                        self.maxSrcCutsPerThreshold is None
+                        or len(srcCuts) < self.maxSrcCutsPerThreshold
+                    )
+                )
+                if canSeparateSrc:
+                    srcStarted = time.perf_counter()
+                    violations = self.srcSeparator.separate(
+                        master, existingKeys=srcCutKeys
+                    )
+                    self._srcSeparationTime += time.perf_counter() - srcStarted
+                    self._srcSeparationCalls += 1
+
+                    if self.maxSrcCutsPerThreshold is not None:
+                        remainingSrcSlots = max(
+                            0, self.maxSrcCutsPerThreshold - len(srcCuts)
+                        )
+                        violations = violations[:remainingSrcSlots]
+
+                    if violations:
+                        for item in violations:
+                            if item.cut.key in srcCutKeys:
+                                continue
+                            srcCutKeys.add(item.cut.key)
+                            srcCuts.append(item.cut)
+                        self._srcCutCount = len(srcCuts)
+                        if outputFlag:
+                            bestViolation = violations[0]
+                            print(
+                                f'      [TH-SRC] +{len(violations)} cuts '
+                                f'(total={len(srcCuts)}, '
+                                f'maxViol={bestViolation.violation:.6g}, '
+                                f'S={bestViolation.cut.customers})'
+                            )
+                        continue
 
                 support = master.getPositiveX(tolerance=1e-10)
                 if master.isIntegral(self.integralityTolerance):
@@ -618,6 +690,8 @@ class ThresholdFeasibilityBpcSolver:
             masterOptimizeCalls=int(self._masterOptimizeCalls),
             srcCuts=int(self._srcCutCount),
             totalCuts=int(len(bssCuts) + self._srcCutCount),
+            srcSeparationTime=float(self._srcSeparationTime),
+            srcSeparationCalls=int(self._srcSeparationCalls),
         )
         if self._activeOutputFlag >= 1:
             print(
@@ -628,6 +702,7 @@ class ThresholdFeasibilityBpcSolver:
                 f'pricing={result.pricingTime:.3f}s '
                 f'(HP={result.heuristicPricingTime:.3f}s, EP={result.exactPricingTime:.3f}s) | '
                 f'BSS={result.bssSchedulingTime:.3f}s | '
+                f'SRCsep={result.srcSeparationTime:.3f}s/{result.srcSeparationCalls} | '
                 f'cuts={result.totalCuts} (BSS={result.bssCuts}, SRC={result.srcCuts})'
             )
         return result
@@ -658,6 +733,11 @@ class ThresholdMakespanBpcSolver:
         heuristicMaxReplacementPositionsPerSeed=5,
         heuristicGreedyStarts=8,
         heuristicGreedyCandidateLimit=16,
+        useSrcCuts=False,
+        srcRootOnly=True,
+        srcViolationTolerance=1e-7,
+        maxSrcCutsPerRound=5,
+        maxSrcCutsPerThreshold=100,
         useSavingsWarmStart=True,
         savingsStarts=12,
         savingsSeed=1,
@@ -680,6 +760,11 @@ class ThresholdMakespanBpcSolver:
         self.heuristicMaxReplacementPositionsPerSeed = int(heuristicMaxReplacementPositionsPerSeed)
         self.heuristicGreedyStarts = int(heuristicGreedyStarts)
         self.heuristicGreedyCandidateLimit = int(heuristicGreedyCandidateLimit)
+        self.useSrcCuts = bool(useSrcCuts)
+        self.srcRootOnly = bool(srcRootOnly)
+        self.srcViolationTolerance = float(srcViolationTolerance)
+        self.maxSrcCutsPerRound = maxSrcCutsPerRound
+        self.maxSrcCutsPerThreshold = maxSrcCutsPerThreshold
         self.useSavingsWarmStart = bool(useSavingsWarmStart)
         self.savingsStarts = int(savingsStarts)
         self.savingsSeed = int(savingsSeed)
@@ -747,6 +832,11 @@ class ThresholdMakespanBpcSolver:
             heuristicMaxReplacementPositionsPerSeed=self.heuristicMaxReplacementPositionsPerSeed,
             heuristicGreedyStarts=self.heuristicGreedyStarts,
             heuristicGreedyCandidateLimit=self.heuristicGreedyCandidateLimit,
+            useSrcCuts=self.useSrcCuts,
+            srcRootOnly=self.srcRootOnly,
+            srcViolationTolerance=self.srcViolationTolerance,
+            maxSrcCutsPerRound=self.maxSrcCutsPerRound,
+            maxSrcCutsPerThreshold=self.maxSrcCutsPerThreshold,
             maxNodes=self.maxNodesPerThreshold,
             timeLimit=remainingTime,
             bssTimeLimit=self.bssTimeLimit,
@@ -929,6 +1019,10 @@ class ThresholdMakespanBpcSolver:
         )
         print(f'BSS schedule  : {self._formatNumber(result.bssSchedulingTime, 3)} s')
         print(
+            f'SRC separation: {self._formatNumber(result.srcSeparationTime, 3)} s '
+            f'(calls={result.srcSeparationCalls})'
+        )
+        print(
             f'Cuts added    : {result.totalCuts} '
             f'(BSS no-good={result.bssCuts}, SRC={result.srcCuts})'
         )
@@ -989,6 +1083,8 @@ class ThresholdMakespanBpcSolver:
         bssCuts = sum(item.bssCuts for item in history)
         srcCuts = sum(item.srcCuts for item in history)
         totalCuts = sum(item.totalCuts for item in history)
+        srcSeparationTime = sum(item.srcSeparationTime for item in history)
+        srcSeparationCalls = sum(item.srcSeparationCalls for item in history)
 
         result = ThresholdMakespanResult(
             status=status,
@@ -1018,6 +1114,8 @@ class ThresholdMakespanBpcSolver:
             bssCuts=int(bssCuts),
             srcCuts=int(srcCuts),
             totalCuts=int(totalCuts),
+            srcSeparationTime=float(srcSeparationTime),
+            srcSeparationCalls=int(srcSeparationCalls),
         )
         if self._activeOutputFlag >= 1:
             self.printResult(

@@ -13,7 +13,7 @@ def testThresholdMakespanBpcEndToEndAgainstExactPathModel():
 
     # One physical BSS, homogeneous vehicles.  Keep the instance small enough
     # for CI, but tight enough that battery / BSS logic is actually exercised.
-    taskCount = 12
+    taskCount = 15
     data = createMockData(taskCount=taskCount, stationCopyCount=taskCount, K=3, seed=4, Q=50, QMin=20)
 
     # Complete vehicle-free threshold BPC solve -- not a pricing unit test.
@@ -28,6 +28,8 @@ def testThresholdMakespanBpcEndToEndAgainstExactPathModel():
         timeLimit=3600,
         maxNodesPerThreshold=10000,
         bssTimeLimit=None,
+        useSrcCuts=True,
+        useHeuristicPricing=True,
     )
     result = solver.solve(lowerBound=0.0, upperBound=None, outputFlag=1)
 
