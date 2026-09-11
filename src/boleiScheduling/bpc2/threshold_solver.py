@@ -18,7 +18,10 @@ from .threshold_master import (
     ThresholdBssNoGoodCut,
     ThresholdRestrictedMasterProblem,
 )
-from .threshold_pricing import ExactThresholdLabelingPricing
+from .threshold_pricing import (
+    ExactThresholdLabelingPricing,
+    HeuristicThresholdPricing,
+)
 
 
 @dataclass(order=True)
@@ -48,6 +51,18 @@ class ThresholdFeasibilityResult:
     runtime: float = 0.0
     pricingCalls: int = 0
     pricingLabels: int = 0
+    heuristicPricingCalls: int = 0
+    heuristicColumns: int = 0
+    masterBuildTime: float = 0.0
+    masterSolveTime: float = 0.0
+    masterTime: float = 0.0
+    heuristicPricingTime: float = 0.0
+    exactPricingTime: float = 0.0
+    pricingTime: float = 0.0
+    bssSchedulingTime: float = 0.0
+    masterOptimizeCalls: int = 0
+    srcCuts: int = 0
+    totalCuts: int = 0
 
 
 @dataclass
@@ -64,6 +79,21 @@ class ThresholdMakespanResult:
     outerIterations: int
     runtime: float
     thresholdHistory: list
+    masterBuildTime: float = 0.0
+    masterSolveTime: float = 0.0
+    masterTime: float = 0.0
+    heuristicPricingTime: float = 0.0
+    exactPricingTime: float = 0.0
+    pricingTime: float = 0.0
+    bssSchedulingTime: float = 0.0
+    masterOptimizeCalls: int = 0
+    pricingCalls: int = 0
+    heuristicPricingCalls: int = 0
+    pricingLabels: int = 0
+    heuristicColumns: int = 0
+    bssCuts: int = 0
+    srcCuts: int = 0
+    totalCuts: int = 0
 
 
 class ThresholdFeasibilityBpcSolver:
@@ -77,6 +107,14 @@ class ThresholdFeasibilityBpcSolver:
         bssScheduler=None,
         profiler=None,
         maxColumnsPerRound=100,
+        useHeuristicPricing=True,
+        maxHeuristicColumnsPerRound=None,
+        heuristicMaxSeedColumns=24,
+        heuristicMaxInsertionCustomersPerSeed=10,
+        heuristicMaxReplacementCustomersPerSeed=5,
+        heuristicMaxReplacementPositionsPerSeed=5,
+        heuristicGreedyStarts=8,
+        heuristicGreedyCandidateLimit=16,
         reducedCostTolerance=1e-8,
         dominanceTolerance=1e-10,
         phaseOneTolerance=1e-8,
@@ -101,10 +139,27 @@ class ThresholdFeasibilityBpcSolver:
             reducedCostTolerance=reducedCostTolerance,
             dominanceTolerance=dominanceTolerance,
         )
+        self.heuristicPricing = HeuristicThresholdPricing(
+            modelData,
+            self.routeEvaluator,
+            reducedCostTolerance=reducedCostTolerance,
+            maxSeedColumns=heuristicMaxSeedColumns,
+            maxInsertionCustomersPerSeed=heuristicMaxInsertionCustomersPerSeed,
+            maxReplacementCustomersPerSeed=heuristicMaxReplacementCustomersPerSeed,
+            maxReplacementPositionsPerSeed=heuristicMaxReplacementPositionsPerSeed,
+            greedyStarts=heuristicGreedyStarts,
+            greedyCandidateLimit=heuristicGreedyCandidateLimit,
+        )
         self.brancher = ThresholdArcFlowBrancher(
             modelData, integralityTolerance=integralityTolerance
         )
         self.maxColumnsPerRound = int(maxColumnsPerRound)
+        self.useHeuristicPricing = bool(useHeuristicPricing)
+        self.maxHeuristicColumnsPerRound = (
+            self.maxColumnsPerRound
+            if maxHeuristicColumnsPerRound is None
+            else max(1, int(maxHeuristicColumnsPerRound))
+        )
         self.reducedCostTolerance = float(reducedCostTolerance)
         self.phaseOneTolerance = float(phaseOneTolerance)
         self.integralityTolerance = float(integralityTolerance)
@@ -113,8 +168,23 @@ class ThresholdFeasibilityBpcSolver:
         self.timeLimit = timeLimit
         self.bssTimeLimit = bssTimeLimit
 
+        # ``_pricingCalls`` remains the number of exact ESPPRC calls for
+        # backwards-compatible diagnostics.  Heuristic calls are tracked
+        # separately.
         self._pricingCalls = 0
         self._pricingLabels = 0
+        self._heuristicPricingCalls = 0
+        self._heuristicColumns = 0
+
+        # Per-fixed-threshold timing/cut statistics.
+        self._masterBuildTime = 0.0
+        self._masterSolveTime = 0.0
+        self._masterOptimizeCalls = 0
+        self._heuristicPricingTime = 0.0
+        self._exactPricingTime = 0.0
+        self._bssSchedulingTime = 0.0
+        self._srcCutCount = 0
+        self._activeOutputFlag = 0
 
     def _remainingTime(self, started):
         if self.timeLimit is None:
@@ -130,6 +200,44 @@ class ThresholdFeasibilityBpcSolver:
     def _addCandidates(self, candidates):
         return self.columnManager.addColumns([candidate.column for candidate in candidates])
 
+    def _heuristicSeedColumns(self, master, tolerance=1e-10):
+        """Return promising current columns for local heuristic pricing.
+
+        Positive LP columns are preferred.  Degenerate/basic or near-zero-RC
+        columns are then used as additional seeds when available.  Access to
+        Gurobi basis/reduced-cost attributes is deliberately best-effort: the
+        heuristic must never affect exactness if those attributes are absent.
+        """
+        ranked = []
+        for routeIndex, var in master.x.items():
+            column = master.columns[routeIndex]
+            if column.isEmpty:
+                continue
+            try:
+                value = float(var.X)
+            except Exception:
+                value = 0.0
+            try:
+                reducedCost = abs(float(var.RC))
+            except Exception:
+                reducedCost = float('inf')
+            try:
+                isBasic = int(var.VBasis) == 0
+            except Exception:
+                isBasic = False
+            priorityClass = 0 if value > tolerance else (1 if isBasic else 2)
+            ranked.append((
+                priorityClass,
+                -value,
+                reducedCost,
+                float(column.duration),
+                routeIndex,
+                column,
+            ))
+        ranked.sort(key=lambda item: item[:-1])
+        limit = self.heuristicPricing.maxSeedColumns
+        return [item[-1] for item in ranked[:limit]]
+
     def _runCgPhase(
         self,
         threshold,
@@ -140,6 +248,7 @@ class ThresholdFeasibilityBpcSolver:
         started,
         outputFlag,
     ):
+        masterBuildStarted = time.perf_counter()
         master = ThresholdRestrictedMasterProblem(
             modelData=self.data,
             columnManager=self.columnManager,
@@ -151,13 +260,18 @@ class ThresholdFeasibilityBpcSolver:
             profiler=self.profiler,
             outputFlag=1 if outputFlag >= 3 else 0,
         )
+        self._masterBuildTime += time.perf_counter() - masterBuildStarted
 
         iteration = 0
         while True:
             remaining = self._remainingTime(started)
             if remaining is not None and remaining <= 0.0:
                 return None, 'TIME_LIMIT'
+            masterSolveStarted = time.perf_counter()
             master.optimize(timeLimit=remaining)
+            masterSolveElapsed = time.perf_counter() - masterSolveStarted
+            self._masterSolveTime += masterSolveElapsed
+            self._masterOptimizeCalls += 1
             if master.isInfeasible() or not master.hasSolution():
                 return master, 'INFEASIBLE_RMP'
 
@@ -165,7 +279,63 @@ class ThresholdFeasibilityBpcSolver:
                 return master, 'PHASE1_FEASIBLE'
 
             duals = master.getDuals()
+
+            # --------------------------------------------------------------
+            # Fast heuristic pricing.  Any columns found here are valid
+            # negative-RC columns, but failure to find one proves nothing.
+            # Therefore exact labeling is called only after the heuristic
+            # neighborhood is exhausted.
+            # --------------------------------------------------------------
+            if self.useHeuristicPricing:
+                heuristicStarted = time.perf_counter()
+                heuristicCandidates = self.heuristicPricing.price(
+                    duals=duals,
+                    existingSignatures=self.columnManager,
+                    threshold=threshold,
+                    phase=phase,
+                    maxColumns=self.maxHeuristicColumnsPerRound,
+                    branchingState=branchState,
+                    seedColumns=self._heuristicSeedColumns(master),
+                )
+                heuristicElapsed = time.perf_counter() - heuristicStarted
+                self._heuristicPricingTime += heuristicElapsed
+                self._heuristicPricingCalls += 1
+
+                if outputFlag >= 2:
+                    hrc = (
+                        heuristicCandidates[0].reducedCost
+                        if heuristicCandidates else None
+                    )
+                    hstats = self.heuristicPricing.lastStatistics
+                    print(
+                        f'      [TH-HP-P{phase}] iter={iteration:03d} '
+                        f'obj={master.getObjectiveValue():.6f} '
+                        f'cols={len(self.columnManager)} '
+                        + (f'bestRC={hrc:.6g} ' if hrc is not None else 'bestRC=none ')
+                        + f'time={heuristicElapsed:.3f}s '
+                        + (
+                            f'evalSeq={hstats.evaluatedSequences} '
+                            f'neg={len(heuristicCandidates)}'
+                            if hstats is not None else ''
+                        )
+                    )
+
+                if heuristicCandidates:
+                    added = self._addCandidates(heuristicCandidates)
+                    if added:
+                        self._heuristicColumns += len(added)
+                        master.syncColumns(self.columnManager)
+                        iteration += 1
+                        continue
+                    # Numerical/duplicate safety: heuristic pricing is not a
+                    # certificate, so fall through to exact pricing.
+
+            # --------------------------------------------------------------
+            # Exact ESPPRC pricing: this is the only routine allowed to
+            # certify that no negative reduced-cost route exists.
+            # --------------------------------------------------------------
             protected = self._protectedSignatures(branchState, bssCuts)
+            exactPricingStarted = time.perf_counter()
             candidates = self.pricing.price(
                 duals=duals,
                 existingSignatures=self.columnManager,
@@ -175,6 +345,8 @@ class ThresholdFeasibilityBpcSolver:
                 branchingState=branchState,
                 protectedSignatures=protected,
             )
+            exactPricingElapsed = time.perf_counter() - exactPricingStarted
+            self._exactPricingTime += exactPricingElapsed
             self._pricingCalls += 1
             if self.pricing.lastStatistics is not None:
                 self._pricingLabels += self.pricing.lastStatistics.generatedLabels
@@ -183,10 +355,11 @@ class ThresholdFeasibilityBpcSolver:
                 rc = candidates[0].reducedCost if candidates else None
                 art = master.getPhaseOneArtificialValue() if phase == 1 else None
                 print(
-                    f'      [TH-CG-P{phase}] iter={iteration:03d} '
+                    f'      [TH-EP-P{phase}] iter={iteration:03d} '
                     f'obj={master.getObjectiveValue():.6f} '
                     + (f'art={art:.3e} ' if art is not None else '')
                     + f'cols={len(self.columnManager)} '
+                    + f'time={exactPricingElapsed:.3f}s '
                     + (f'bestRC={rc:.6g}' if rc is not None else 'bestRC=none')
                 )
 
@@ -220,9 +393,24 @@ class ThresholdFeasibilityBpcSolver:
     def solve(self, threshold, outputFlag=1, srcCuts=None):
         threshold = float(threshold)
         started = time.perf_counter()
+        self._activeOutputFlag = int(outputFlag)
+
+        # Reset per-threshold statistics in case this solver object is reused.
+        self._pricingCalls = 0
+        self._pricingLabels = 0
+        self._heuristicPricingCalls = 0
+        self._heuristicColumns = 0
+        self._masterBuildTime = 0.0
+        self._masterSolveTime = 0.0
+        self._masterOptimizeCalls = 0
+        self._heuristicPricingTime = 0.0
+        self._exactPricingTime = 0.0
+        self._bssSchedulingTime = 0.0
+
         bssCuts = []
         bssCutKeys = set()
         srcCuts = list(srcCuts or ())
+        self._srcCutCount = len(srcCuts)
         queue = []
         serial = 0
         heapq.heappush(queue, _ThresholdNode(0.0, serial, 0, ThresholdBranchState.root(), 0.0))
@@ -277,9 +465,14 @@ class ThresholdFeasibilityBpcSolver:
                 lb = master.getObjectiveValue()
                 bestLp = min(bestLp, lb)
                 if outputFlag:
+                    pricingTime = self._heuristicPricingTime + self._exactPricingTime
+                    totalCuts = len(bssCuts) + self._srcCutCount
                     print(
                         f'      [TH-LP] minRoutesLB={lb:.6f} | K={self.data.K} '
-                        f'| cols={len(self.columnManager)} | BSS cuts={len(bssCuts)}'
+                        f'| cols={len(self.columnManager)} '
+                        f'| cuts={totalCuts} (BSS={len(bssCuts)}, SRC={self._srcCutCount}) '
+                        f'| master={self._masterBuildTime + self._masterSolveTime:.3f}s '
+                        f'| pricing={pricingTime:.3f}s'
                     )
 
                 # Objective is integer route count.  If the LP lower bound is
@@ -299,12 +492,14 @@ class ThresholdFeasibilityBpcSolver:
                         rem = self._remainingTime(started)
                         if rem is not None:
                             localBssLimit = rem if localBssLimit is None else min(localBssLimit, rem)
+                    bssStarted = time.perf_counter()
                     bssResult = self.bssScheduler.solve(
                         selectedColumns,
                         outputFlag=0,
                         timeLimit=localBssLimit,
                         mipGap=0.0,
                     )
+                    self._bssSchedulingTime += time.perf_counter() - bssStarted
                     if not bssResult.provenOptimal:
                         return self._result(
                             threshold, False, False, 'BSS_NOT_PROVEN', selectedColumns,
@@ -394,7 +589,7 @@ class ThresholdFeasibilityBpcSolver:
         started,
         bestLp,
     ):
-        return ThresholdFeasibilityResult(
+        result = ThresholdFeasibilityResult(
             threshold=float(threshold),
             feasible=bool(feasible),
             proven=bool(proven),
@@ -411,7 +606,31 @@ class ThresholdFeasibilityBpcSolver:
             runtime=time.perf_counter() - started,
             pricingCalls=self._pricingCalls,
             pricingLabels=self._pricingLabels,
+            heuristicPricingCalls=self._heuristicPricingCalls,
+            heuristicColumns=self._heuristicColumns,
+            masterBuildTime=float(self._masterBuildTime),
+            masterSolveTime=float(self._masterSolveTime),
+            masterTime=float(self._masterBuildTime + self._masterSolveTime),
+            heuristicPricingTime=float(self._heuristicPricingTime),
+            exactPricingTime=float(self._exactPricingTime),
+            pricingTime=float(self._heuristicPricingTime + self._exactPricingTime),
+            bssSchedulingTime=float(self._bssSchedulingTime),
+            masterOptimizeCalls=int(self._masterOptimizeCalls),
+            srcCuts=int(self._srcCutCount),
+            totalCuts=int(len(bssCuts) + self._srcCutCount),
         )
+        if self._activeOutputFlag >= 1:
+            print(
+                f'    [TH-STATS] T={float(threshold):.6f} '
+                f'master={result.masterTime:.3f}s '
+                f'(build={result.masterBuildTime:.3f}s, solve={result.masterSolveTime:.3f}s, '
+                f'calls={result.masterOptimizeCalls}) | '
+                f'pricing={result.pricingTime:.3f}s '
+                f'(HP={result.heuristicPricingTime:.3f}s, EP={result.exactPricingTime:.3f}s) | '
+                f'BSS={result.bssSchedulingTime:.3f}s | '
+                f'cuts={result.totalCuts} (BSS={result.bssCuts}, SRC={result.srcCuts})'
+            )
+        return result
 
 
 class ThresholdMakespanBpcSolver:
@@ -431,6 +650,14 @@ class ThresholdMakespanBpcSolver:
         relativeTolerance=1e-6,
         maxOuterIterations=60,
         maxColumnsPerRound=100,
+        useHeuristicPricing=True,
+        maxHeuristicColumnsPerRound=None,
+        heuristicMaxSeedColumns=24,
+        heuristicMaxInsertionCustomersPerSeed=10,
+        heuristicMaxReplacementCustomersPerSeed=5,
+        heuristicMaxReplacementPositionsPerSeed=5,
+        heuristicGreedyStarts=8,
+        heuristicGreedyCandidateLimit=16,
         useSavingsWarmStart=True,
         savingsStarts=12,
         savingsSeed=1,
@@ -445,6 +672,14 @@ class ThresholdMakespanBpcSolver:
         self.relativeTolerance = float(relativeTolerance)
         self.maxOuterIterations = int(maxOuterIterations)
         self.maxColumnsPerRound = int(maxColumnsPerRound)
+        self.useHeuristicPricing = bool(useHeuristicPricing)
+        self.maxHeuristicColumnsPerRound = maxHeuristicColumnsPerRound
+        self.heuristicMaxSeedColumns = int(heuristicMaxSeedColumns)
+        self.heuristicMaxInsertionCustomersPerSeed = int(heuristicMaxInsertionCustomersPerSeed)
+        self.heuristicMaxReplacementCustomersPerSeed = int(heuristicMaxReplacementCustomersPerSeed)
+        self.heuristicMaxReplacementPositionsPerSeed = int(heuristicMaxReplacementPositionsPerSeed)
+        self.heuristicGreedyStarts = int(heuristicGreedyStarts)
+        self.heuristicGreedyCandidateLimit = int(heuristicGreedyCandidateLimit)
         self.useSavingsWarmStart = bool(useSavingsWarmStart)
         self.savingsStarts = int(savingsStarts)
         self.savingsSeed = int(savingsSeed)
@@ -504,6 +739,14 @@ class ThresholdMakespanBpcSolver:
             bssScheduler=self.bssScheduler,
             profiler=self.profiler,
             maxColumnsPerRound=self.maxColumnsPerRound,
+            useHeuristicPricing=self.useHeuristicPricing,
+            maxHeuristicColumnsPerRound=self.maxHeuristicColumnsPerRound,
+            heuristicMaxSeedColumns=self.heuristicMaxSeedColumns,
+            heuristicMaxInsertionCustomersPerSeed=self.heuristicMaxInsertionCustomersPerSeed,
+            heuristicMaxReplacementCustomersPerSeed=self.heuristicMaxReplacementCustomersPerSeed,
+            heuristicMaxReplacementPositionsPerSeed=self.heuristicMaxReplacementPositionsPerSeed,
+            heuristicGreedyStarts=self.heuristicGreedyStarts,
+            heuristicGreedyCandidateLimit=self.heuristicGreedyCandidateLimit,
             maxNodes=self.maxNodesPerThreshold,
             timeLimit=remainingTime,
             bssTimeLimit=self.bssTimeLimit,
@@ -665,6 +908,31 @@ class ThresholdMakespanBpcSolver:
         print(f'Outer checks  : {result.outerIterations}')
         print(f'Runtime       : {self._formatNumber(result.runtime, 3)} s')
 
+        print('\n' + '-' * width)
+        print('TIMING / CUT STATISTICS')
+        print('-' * width)
+        print(
+            f'Master total  : {self._formatNumber(result.masterTime, 3)} s '
+            f'(build={self._formatNumber(result.masterBuildTime, 3)} s, '
+            f'solve={self._formatNumber(result.masterSolveTime, 3)} s, '
+            f'optimize calls={result.masterOptimizeCalls})'
+        )
+        print(
+            f'Pricing total : {self._formatNumber(result.pricingTime, 3)} s '
+            f'(heuristic={self._formatNumber(result.heuristicPricingTime, 3)} s, '
+            f'exact={self._formatNumber(result.exactPricingTime, 3)} s)'
+        )
+        print(
+            f'Pricing calls : heuristic={result.heuristicPricingCalls}, '
+            f'exact={result.pricingCalls}, exact labels={result.pricingLabels}, '
+            f'heuristic cols={result.heuristicColumns}'
+        )
+        print(f'BSS schedule  : {self._formatNumber(result.bssSchedulingTime, 3)} s')
+        print(
+            f'Cuts added    : {result.totalCuts} '
+            f'(BSS no-good={result.bssCuts}, SRC={result.srcCuts})'
+        )
+
         details = self.getRouteDetails(result)
         if details:
             print('\n' + '-' * width)
@@ -706,6 +974,22 @@ class ThresholdMakespanBpcSolver:
         gap = max(0.0, float(ub) - float(lb))
         rel = gap / max(1.0, abs(float(ub))) if math.isfinite(float(ub)) else float('inf')
         objective = float(ub) if bssResult is not None else float('inf')
+
+        # Aggregate statistics across all fixed-threshold solves in this run.
+        masterBuildTime = sum(item.masterBuildTime for item in history)
+        masterSolveTime = sum(item.masterSolveTime for item in history)
+        heuristicPricingTime = sum(item.heuristicPricingTime for item in history)
+        exactPricingTime = sum(item.exactPricingTime for item in history)
+        bssSchedulingTime = sum(item.bssSchedulingTime for item in history)
+        masterOptimizeCalls = sum(item.masterOptimizeCalls for item in history)
+        pricingCalls = sum(item.pricingCalls for item in history)
+        heuristicPricingCalls = sum(item.heuristicPricingCalls for item in history)
+        pricingLabels = sum(item.pricingLabels for item in history)
+        heuristicColumns = sum(item.heuristicColumns for item in history)
+        bssCuts = sum(item.bssCuts for item in history)
+        srcCuts = sum(item.srcCuts for item in history)
+        totalCuts = sum(item.totalCuts for item in history)
+
         result = ThresholdMakespanResult(
             status=status,
             provenWithinTolerance=bool(proven),
@@ -719,6 +1003,21 @@ class ThresholdMakespanBpcSolver:
             outerIterations=len(history),
             runtime=time.perf_counter() - started,
             thresholdHistory=list(history),
+            masterBuildTime=float(masterBuildTime),
+            masterSolveTime=float(masterSolveTime),
+            masterTime=float(masterBuildTime + masterSolveTime),
+            heuristicPricingTime=float(heuristicPricingTime),
+            exactPricingTime=float(exactPricingTime),
+            pricingTime=float(heuristicPricingTime + exactPricingTime),
+            bssSchedulingTime=float(bssSchedulingTime),
+            masterOptimizeCalls=int(masterOptimizeCalls),
+            pricingCalls=int(pricingCalls),
+            heuristicPricingCalls=int(heuristicPricingCalls),
+            pricingLabels=int(pricingLabels),
+            heuristicColumns=int(heuristicColumns),
+            bssCuts=int(bssCuts),
+            srcCuts=int(srcCuts),
+            totalCuts=int(totalCuts),
         )
         if self._activeOutputFlag >= 1:
             self.printResult(
