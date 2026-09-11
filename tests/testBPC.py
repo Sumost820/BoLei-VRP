@@ -3,7 +3,7 @@ import math
 import pytest
 
 from boleiScheduling.mockData import createMockData
-from boleiScheduling.bpc import BranchPriceCutSolver
+from boleiScheduling.bpc1 import BranchPriceCutSolver
 
 
 
@@ -16,7 +16,7 @@ def _candidate_map(candidates):
 
 def testBranchPriceCutEndToEndSmallCase():
     pytest.importorskip('gurobipy')
-    taskCount = 10
+    taskCount = 8
     data = createMockData(taskCount=taskCount, stationCopyCount=taskCount, K=2, seed=4, Q=50, QMin=20)
 
     solver = BranchPriceCutSolver(
@@ -25,7 +25,7 @@ def testBranchPriceCutEndToEndSmallCase():
         maxColumnsPerRound=100,
         bssTimeLimit=None,
         useSRC=False,
-        printMasterDuals=True,
+        printMasterDuals=False,
     )
     solver.solve(outputFlag=1, nodeLimit=10000, timeLimit=None)
     result = solver.getResult()

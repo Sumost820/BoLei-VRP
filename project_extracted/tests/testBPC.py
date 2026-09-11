@@ -3,7 +3,7 @@ import math
 import pytest
 
 from boleiScheduling.mockData import createMockData
-from boleiScheduling.bpc import BranchPriceCutSolver
+from boleiScheduling.bpc1 import BranchPriceCutSolver
 
 
 

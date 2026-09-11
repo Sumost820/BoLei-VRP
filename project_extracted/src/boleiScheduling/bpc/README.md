@@ -92,7 +92,7 @@ routing/swap model.
 ## Example
 
 ```python
-from boleiScheduling.bpc import BranchPriceCutSolver
+from boleiScheduling.bpc1 import BranchPriceCutSolver
 from boleiScheduling.mockData import createMockData
 
 data = createMockData(

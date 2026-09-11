@@ -118,7 +118,7 @@ BSS cut 用 `route signature -> cut keys`；SRC 用 customer incidence bitset。
 ## 入口
 
 ```python
-from boleiScheduling.bpc import BranchPriceCutSolver
+from boleiScheduling.bpc1 import BranchPriceCutSolver
 
 solver = BranchPriceCutSolver(data)
 solver.solve(outputFlag=1)

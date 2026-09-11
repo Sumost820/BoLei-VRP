@@ -3,7 +3,7 @@ import pytest
 pytest.importorskip("gurobipy")
 
 from boleiScheduling.mockData import createMockData
-from boleiScheduling.routePoolHeuristic.heuristicScheduler import RoutePoolHeuristicScheduler
+from boleiScheduling.GeneratorAndAssemblerHeuristic.heuristicScheduler import RoutePoolHeuristicScheduler
 
 
 def testRoutePoolHeuristicPrintsFinalRoutesAndSwapSchedule():

@@ -9,8 +9,8 @@ from dataclasses import dataclass
 sys.path.insert(0, 'src')
 
 from boleiScheduling.mockData import createMockData
-from boleiScheduling.bpc.swap_dp import ExactFixedSequenceEvaluator
-from boleiScheduling.bpc.pricing import ExactLabelingPricing
+from boleiScheduling.bpc1.swap_dp import ExactFixedSequenceEvaluator
+from boleiScheduling.bpc1.pricing import ExactLabelingPricing
 
 
 @dataclass
