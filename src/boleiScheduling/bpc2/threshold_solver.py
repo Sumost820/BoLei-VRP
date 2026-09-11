@@ -801,6 +801,7 @@ class ThresholdMakespanBpcSolver:
         srcViolationTolerance=1e-7,
         maxSrcCutsPerRound=5,
         maxSrcCutsPerThreshold=20,
+        useSingleTaskLowerBound=True,
         useSavingsWarmStart=True,
         savingsStarts=12,
         savingsSeed=1,
@@ -832,6 +833,7 @@ class ThresholdMakespanBpcSolver:
         self.srcViolationTolerance = float(srcViolationTolerance)
         self.maxSrcCutsPerRound = maxSrcCutsPerRound
         self.maxSrcCutsPerThreshold = maxSrcCutsPerThreshold
+        self.useSingleTaskLowerBound = bool(useSingleTaskLowerBound)
         self.useSavingsWarmStart = bool(useSavingsWarmStart)
         self.savingsStarts = int(savingsStarts)
         self.savingsSeed = int(savingsSeed)
@@ -852,6 +854,104 @@ class ThresholdMakespanBpcSolver:
         if self.timeLimit is None:
             return None
         return max(0.0, float(self.timeLimit) - (time.perf_counter() - started))
+
+    def _singleTaskLowerBoundForTask(self, task):
+        """Return the requested isolated lower-bound route for one task.
+
+        First try DepotStart -> task -> DepotEnd.  Only when that direct route
+        violates the battery resource do we try exactly one swap after the task:
+        DepotStart -> task -> BSS -> DepotEnd.  Shared-BSS queueing is ignored.
+        """
+        data = self.data
+        start = data.startNode
+        end = data.endNode
+        station = data.S[0] if data.S else None
+        first = (start, task)
+        directTail = (task, end)
+
+        directDuration = None
+        directEnergyFeasible = False
+        if (
+            first in data.t and first in data.e
+            and directTail in data.t and directTail in data.e
+        ):
+            directDuration = (
+                float(data.t[first])
+                + float(data.p[task])
+                + float(data.t[directTail])
+            )
+            energyAfterTask = (
+                float(data.Q)
+                - float(data.e[first])
+                - float(data.q[task])
+            )
+            energyAtEnd = energyAfterTask - float(data.e[directTail])
+            directEnergyFeasible = (
+                energyAfterTask >= float(data.QMin) - 1e-9
+                and energyAtEnd >= float(data.QMin) - 1e-9
+            )
+
+        if directEnergyFeasible:
+            return directDuration, (start, task, end), 0, 'direct'
+
+        # The current physical route graph permits a BSS visit only after a
+        # customer, hence a one-task route can have at most this one swap.
+        if station is not None and first in data.t and first in data.e:
+            toStation = (task, station)
+            stationToEnd = (station, end)
+            if (
+                toStation in data.t and toStation in data.e
+                and stationToEnd in data.t and stationToEnd in data.e
+            ):
+                energyAfterTask = (
+                    float(data.Q)
+                    - float(data.e[first])
+                    - float(data.q[task])
+                )
+                energyAtStation = energyAfterTask - float(data.e[toStation])
+                energyAtEndAfterSwap = float(data.Q) - float(data.e[stationToEnd])
+                if (
+                    energyAfterTask >= float(data.QMin) - 1e-9
+                    and energyAtStation >= float(data.QMin) - 1e-9
+                    and energyAtEndAfterSwap >= float(data.QMin) - 1e-9
+                ):
+                    duration = (
+                        float(data.t[first])
+                        + float(data.p[task])
+                        + float(data.t[toStation])
+                        + float(data.p[station])
+                        + float(data.t[stationToEnd])
+                    )
+                    return duration, (start, task, station, end), 1, 'one-swap'
+
+        # If the requested one-task route is not battery-feasible even with one
+        # swap, retain only the direct travel/service time as an energy-relaxed
+        # lower bound rather than incorrectly declaring the full problem
+        # infeasible.
+        if directDuration is not None:
+            return directDuration, (start, task, end), 0, 'energy-relaxed'
+        return None, None, 0, 'unavailable'
+
+    def _computeSingleTaskLowerBound(self):
+        """Return max_i LB_i for the requested start-task-end bound."""
+        bestValue = 0.0
+        bestTask = None
+        bestNodes = None
+        bestSwaps = 0
+        bestMode = None
+
+        for task in self.data.C:
+            value, nodes, swaps, mode = self._singleTaskLowerBoundForTask(task)
+            if value is None:
+                continue
+            if float(value) > bestValue:
+                bestValue = float(value)
+                bestTask = task
+                bestNodes = nodes
+                bestSwaps = int(swaps)
+                bestMode = mode
+
+        return bestValue, bestTask, bestNodes, bestSwaps, bestMode
 
     def _initializeWarmStart(self, outputFlag):
         if not self.useSavingsWarmStart:
@@ -916,9 +1016,36 @@ class ThresholdMakespanBpcSolver:
     def solve(self, lowerBound=0.0, upperBound=None, outputFlag=1):
         self._activeOutputFlag = int(outputFlag)
         started = time.perf_counter()
+
+        userLb = max(0.0, float(lowerBound))
+        singleTaskLb = 0.0
+        singleTask = None
+        singleTaskNodes = None
+        singleTaskSwaps = 0
+        singleTaskMode = None
+        if self.useSingleTaskLowerBound:
+            (
+                singleTaskLb,
+                singleTask,
+                singleTaskNodes,
+                singleTaskSwaps,
+                singleTaskMode,
+            ) = self._computeSingleTaskLowerBound()
+
+        lb = max(userLb, singleTaskLb)
+        if outputFlag and self.useSingleTaskLowerBound:
+            if singleTask is None:
+                print(f'[TH-LB] user={userLb:.6f} singleTask=0.000000 initial={lb:.6f}')
+            else:
+                path = ' -> '.join(self._nodeLabel(node) for node in singleTaskNodes)
+                print(
+                    f'[TH-LB] user={userLb:.6f} singleTask={singleTaskLb:.6f} '
+                    f'(task=C{singleTask}, swaps={singleTaskSwaps}, mode={singleTaskMode}, '
+                    f'path={path}) initial={lb:.6f}'
+                )
+
         warmUb, warmIncumbent = self._initializeWarmStart(outputFlag)
 
-        lb = max(0.0, float(lowerBound))
         incumbentRoutes = []
         incumbentBss = None
         if warmIncumbent is not None:
