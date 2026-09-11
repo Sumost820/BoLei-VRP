@@ -4,33 +4,26 @@ from boleiScheduling.mockData import createMockData
 from boleiScheduling.bpc2 import ThresholdMakespanBpcSolver
 
 
-def _served_tasks(columns):
-    return [task for column in columns for task in column.tasks]
-
-
 def testThresholdMakespanBpcEndToEndAgainstExactPathModel():
     pytest.importorskip("gurobipy")
 
-    # One physical BSS, homogeneous vehicles.  Keep the instance small enough
-    # for CI, but tight enough that battery / BSS logic is actually exercised.
     taskCount = 15
     data = createMockData(taskCount=taskCount, stationCopyCount=taskCount, K=3, seed=4, Q=50, QMin=20)
 
-    # Complete vehicle-free threshold BPC solve -- not a pricing unit test.
+    # 二分容差 UB-LB
     tolerance = 1e-3
     solver = ThresholdMakespanBpcSolver(
         data,
         thresholdTolerance=tolerance,
         relativeTolerance=0,
-        maxOuterIterations=80,
-        maxColumnsPerRound=100,
-        useSavingsWarmStart=True,
-        timeLimit=3600,
-        maxNodesPerThreshold=10000,
-        bssTimeLimit=None,
-        useSrcCuts=True,
-        useHeuristicPricing=True,
+        maxOuterIterations=50,             # 最大二分次数/执行BPC次数
+        maxColumnsPerRound=100,            # 每轮子问题返回的最大列数
+        useSavingsWarmStart=True,          # 节约算法热启动列池
+        useHeuristicPricing=True,          # 启发式定价
+        timeLimit=3600,                    # 最大运行时间
+        useSrcCuts=True,                   # SRC
     )
+
     result = solver.solve(lowerBound=0.0, upperBound=None, outputFlag=1)
 
 

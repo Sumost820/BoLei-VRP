@@ -17,12 +17,7 @@ def assertEveryTaskExactlyOnce(data, routes):
 
 
 def testALNSExactGurobi():
-    """
-    End-to-end test of the complete ALNS architecture:
-      destroy/repair + adaptive weights + SA
-      + fixed-route swap DP
-      + joint Gurobi BSS scheduling.
-    """
+
     pytest.importorskip("gurobipy")
 
     taskCount = 50
