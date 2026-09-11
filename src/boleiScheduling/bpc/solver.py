@@ -5,10 +5,15 @@ from dataclasses import dataclass, field
 
 from .master import RestrictedMasterProblem, PersistentRestrictedMasterProblem
 from .pricing import ExactEnumerativePricing, ExactLabelingPricing
-from .swap_dp import ExactFixedSequenceEvaluator
+from .swap_dp import ExactCompleteRouteEvaluator
 from .bss import ExactBssScheduler, BssScheduleResult
 from .cuts import BssOptimalityCut, ThreeRowSubsetCutSeparator
-from .branch import ArcBranchingState, ArcFlowBrancher
+from .branch import (
+    ArcBranchingState,
+    ArcBranchDecision,
+    PrecedenceBranchDecision,
+    ArcFlowBrancher,
+)
 from .savings import SavingsWarmStart
 from .columnManager import ColumnManager
 from .profiler import PerformanceProfiler
@@ -66,11 +71,12 @@ class RootColumnGenerationSolver:
         preGenerateShortRoutes=2,
         shortRouteTaskThreshold=15,
         maxShortRouteColumns=1000,
+        printMasterDuals=False,
     ):
         self.data = modelData
         self.profiler = PerformanceProfiler()
-        self.sequenceEvaluator = ExactFixedSequenceEvaluator(modelData, profiler=self.profiler)
-        emptyColumn = self.sequenceEvaluator.evaluate(())
+        self.routeEvaluator = ExactCompleteRouteEvaluator(modelData, profiler=self.profiler)
+        emptyColumn = self.routeEvaluator.evaluate(())
         self.columnManager = ColumnManager([emptyColumn])
         self.columns = self.columnManager.columns
         self.signatureToIndex = self.columnManager.signatureToIndex
@@ -79,7 +85,7 @@ class RootColumnGenerationSolver:
         if pricingMode == 'labeling':
             self.pricing = ExactLabelingPricing(
                 modelData=modelData,
-                sequenceEvaluator=self.sequenceEvaluator,
+                routeEvaluator=self.routeEvaluator,
                 reducedCostTolerance=reducedCostTolerance,
                 dominanceTolerance=dominanceTolerance,
                 dominanceMode=dominanceMode,
@@ -87,7 +93,7 @@ class RootColumnGenerationSolver:
         elif pricingMode == 'enumerative':
             self.pricing = ExactEnumerativePricing(
                 modelData=modelData,
-                sequenceEvaluator=self.sequenceEvaluator,
+                routeEvaluator=self.routeEvaluator,
                 maxEnumeratedTasks=maxEnumeratedTasks,
                 reducedCostTolerance=reducedCostTolerance,
             )
@@ -110,6 +116,7 @@ class RootColumnGenerationSolver:
         self.preGenerateShortRoutes = max(0, int(preGenerateShortRoutes))
         self.shortRouteTaskThreshold = max(0, int(shortRouteTaskThreshold))
         self.maxShortRouteColumns = maxShortRouteColumns
+        self.printMasterDuals = bool(printMasterDuals)
         self.shortRouteColumnsAdded = 0
         self.shortRouteBuildTime = 0.0
         self.shortRouteInitialized = False
@@ -125,7 +132,9 @@ class RootColumnGenerationSolver:
         self.status = 'NOT_SOLVED'
 
     def _existingSignatures(self):
-        return self.columnManager.signatures()
+        # Pass the manager itself so pricing sees the global signature index
+        # without copying the full set every column-generation round.
+        return self.columnManager
 
     def _addPricingCandidates(self, candidates):
         addedColumns = self.columnManager.addCandidates(candidates)
@@ -143,7 +152,7 @@ class RootColumnGenerationSolver:
 
         builder = SavingsWarmStart(
             modelData=self.data,
-            sequenceEvaluator=self.sequenceEvaluator,
+            routeEvaluator=self.routeEvaluator,
             starts=self.savingsStarts,
             seed=self.savingsSeed,
             randomization=self.savingsRandomization,
@@ -198,9 +207,7 @@ class RootColumnGenerationSolver:
 
         for length in range(1, min(self.preGenerateShortRoutes, len(tasks)) + 1):
             for sequence in _itertools.permutations(tasks, length):
-                if sequence in self.signatureToIndex:
-                    continue
-                column = self.sequenceEvaluator.evaluate(sequence)
+                column = self.routeEvaluator.evaluate(sequence)
                 if column is None:
                     continue
                 wasAdded, _ = self.columnManager.add(column)
@@ -217,7 +224,7 @@ class RootColumnGenerationSolver:
         self.profiler.addTime('shortRouteWarmStart', self.shortRouteBuildTime)
         if outputFlag and added:
             print(
-                f'[SHORT ROUTES] exact sequences length<= {self.preGenerateShortRoutes} | '
+                f'[SHORT ROUTES] isolated-best complete routes for customer sequences length<= {self.preGenerateShortRoutes} | '
                 f'+{added} columns | time={self.shortRouteBuildTime:.3f}s'
             )
         return added
@@ -257,6 +264,69 @@ class RootColumnGenerationSolver:
             f'bestRC={rcText:>12} | {state}'
         )
 
+    def _printMasterDualValues(self, master, duals, phase, iteration):
+        """Print the complete LP dual vector used by the current pricing round.
+
+        BSS-cut duals are shown only for diagnosis.  They are master-only and
+        deliberately are not part of ``MasterDuals`` passed to pricing.
+        """
+        phaseName = 'P1' if phase == 1 else 'P2'
+
+        coverageText = ', '.join(
+            f'C{task}={_format_number(duals.coverage[task], 6)}'
+            for task in self.data.C
+        )
+        slotText = ', '.join(
+            f'V{k + 1}={_format_number(duals.slot[k], 6)}'
+            for k in range(self.data.K)
+        )
+        makespanText = ', '.join(
+            f'V{k + 1}={_format_number(duals.makespan[k], 6)}'
+            for k in range(self.data.K)
+        )
+        betaSum = sum(float(duals.makespan[k]) for k in range(self.data.K))
+
+        print(
+            f'    [DUAL-{phaseName}] iter={iteration:03d} | '
+            f'coverage: {coverageText}'
+        )
+        print(
+            f'    [DUAL-{phaseName}] iter={iteration:03d} | '
+            f'slot: {slotText}'
+        )
+        print(
+            f'    [DUAL-{phaseName}] iter={iteration:03d} | '
+            f'beta/makespan: {makespanText} | sumBeta={_format_number(betaSum, 6)}'
+        )
+
+        if getattr(duals, 'src', None):
+            srcItems = []
+            for cut, value in sorted(
+                duals.src.items(),
+                key=lambda item: getattr(item[0], 'key', repr(item[0])),
+            ):
+                customers = getattr(cut, 'customers', None)
+                label = (
+                    '{' + ','.join(f'C{i}' for i in customers) + '}'
+                    if customers is not None
+                    else repr(getattr(cut, 'key', cut))
+                )
+                srcItems.append(f'{label}={_format_number(value, 6)}')
+            print(
+                f'    [DUAL-{phaseName}] iter={iteration:03d} | '
+                f'SRC: {", ".join(srcItems)}'
+            )
+
+        bssDuals = master.getBssCutDuals() if phase == 2 else {}
+        if bssDuals:
+            bssItems = []
+            for index, (cut, value) in enumerate(bssDuals.items(), start=1):
+                bssItems.append(f'cut{index}={_format_number(value, 6)}')
+            print(
+                f'    [DUAL-{phaseName}] iter={iteration:03d} | '
+                f'BSS(master-only): {", ".join(bssItems)}'
+            )
+
     def _newPersistentMaster(
         self,
         phase,
@@ -266,7 +336,7 @@ class RootColumnGenerationSolver:
     ):
         return PersistentRestrictedMasterProblem(
             self.data,
-            self.columns,
+            columns=None,
             phase=phase,
             bssCuts=(self.bssCuts if phase == 2 else None),
             srcCuts=(self.srcCuts if phase == 2 else None),
@@ -275,6 +345,7 @@ class RootColumnGenerationSolver:
             timeLimit=timeLimit,
             profiler=self.profiler,
             useDualSimplex=True,
+            columnManager=self.columnManager,
         )
 
     def _runPersistentCG(
@@ -296,7 +367,7 @@ class RootColumnGenerationSolver:
             iteration += 1
             columnsBefore = len(self.columns)
 
-            master.syncColumns(self.columns)
+            master.syncColumns(self.columnManager)
             if phase == 2:
                 master.syncBssCuts(self.bssCuts)
                 master.syncSrcCuts(self.srcCuts)
@@ -332,6 +403,13 @@ class RootColumnGenerationSolver:
                 return iteration, 'OPTIMAL'
 
             duals = master.getDuals()
+            if self.printMasterDuals and outputFlag:
+                self._printMasterDualValues(
+                    master=master,
+                    duals=duals,
+                    phase=phase,
+                    iteration=iteration,
+                )
             with self.profiler.timeBlock('pricing'):
                 candidates = self.pricing.price(
                     duals=duals,
@@ -370,7 +448,7 @@ class RootColumnGenerationSolver:
             addedColumns = self._addPricingCandidates(candidates)
             added = len(addedColumns)
             if addedColumns:
-                master.addColumns(addedColumns)
+                master.syncColumns(self.columnManager)
 
             if outputFlag >= 2:
                 self._printCgProgress(
@@ -446,193 +524,13 @@ class RootColumnGenerationSolver:
             'shortRouteColumnsAdded': self.shortRouteColumnsAdded,
             'shortRouteBuildTime': self.shortRouteBuildTime,
             'performanceProfile': self.profiler.snapshot(),
-            'cacheStatistics': collectCacheStatistics(self.sequenceEvaluator, None),
+            'cacheStatistics': collectCacheStatistics(self.routeEvaluator, None),
             'warmStartFeasibleStarts': (
                 self.warmStartResult.feasibleStarts
                 if self.warmStartResult is not None else 0
             ),
             'positiveX': self.master.getPositiveX() if self.master is not None and self.master.model.SolCount else [],
         }
-
-
-class RootBpcCutSolver(RootColumnGenerationSolver):
-    """V0.3 root-CG + exact fixed-combination BSS cut separation reference."""
-
-    def __init__(
-        self,
-        modelData,
-        pricingMode='labeling',
-        maxEnumeratedTasks=9,
-        maxColumnsPerRound=50,
-        reducedCostTolerance=1e-8,
-        dominanceTolerance=1e-10,
-        phaseOneTolerance=1e-8,
-        cutTolerance=1e-7,
-        maxBssCuts=1000,
-        maxExactRouteTasks=None,
-        bssTimeLimit=None,
-        dominanceMode='subset',
-        useSavingsWarmStart=True,
-        savingsStarts=12,
-        savingsSeed=1,
-        savingsRandomization=0.20,
-        savingsExcessRoutePenalty=1.0e9,
-        maxWarmStartColumns=1000,
-    ):
-        super().__init__(
-            modelData=modelData,
-            pricingMode=pricingMode,
-            maxEnumeratedTasks=maxEnumeratedTasks,
-            maxColumnsPerRound=maxColumnsPerRound,
-            reducedCostTolerance=reducedCostTolerance,
-            dominanceTolerance=dominanceTolerance,
-            phaseOneTolerance=phaseOneTolerance,
-            bssCuts=[],
-            srcCuts=[],
-            dominanceMode=dominanceMode,
-            useSavingsWarmStart=useSavingsWarmStart,
-            savingsStarts=savingsStarts,
-            savingsSeed=savingsSeed,
-            savingsRandomization=savingsRandomization,
-            savingsExcessRoutePenalty=savingsExcessRoutePenalty,
-            maxWarmStartColumns=maxWarmStartColumns,
-        )
-
-        self.cutTolerance = cutTolerance
-        self.maxBssCuts = maxBssCuts
-        self.bssTimeLimit = bssTimeLimit
-        self.bssScheduler = ExactBssScheduler(
-            modelData=modelData,
-            sequenceEvaluator=self.sequenceEvaluator,
-            maxExactRouteTasks=maxExactRouteTasks,
-        )
-
-        self.cutByKey = {}
-        self.integerMaster = None
-        self.integerMasterT = float('inf')
-        self.bssObjective = float('inf')
-        self.bssResult = None
-        self.selectedColumns = []
-        self.cutRounds = 0
-
-    def _addOrStrengthenCut(self, selectedColumns, value):
-        signatures = [
-            column.signature
-            for column in selectedColumns
-            if not column.isEmpty
-        ]
-        cut = BssOptimalityCut.canonical(signatures, value)
-
-        previous = self.cutByKey.get(cut.key)
-        if previous is not None and previous.value >= cut.value - self.cutTolerance:
-            return False
-
-        self.cutByKey[cut.key] = cut
-        self.bssCuts = list(self.cutByKey.values())
-        return True
-
-    def _solveIntegerRestrictedMaster(self, outputFlag=0):
-        master = RestrictedMasterProblem(
-            self.data,
-            self.columns,
-            bssCuts=self.bssCuts,
-            srcCuts=self.srcCuts,
-        )
-        model = master.solve(phase=2, outputFlag=self._gurobiOutputFlag(outputFlag), binary=True)
-
-        try:
-            from gurobipy import GRB
-        except ImportError as error:
-            raise ImportError('RootBpcCutSolver requires gurobipy') from error
-
-        if model.Status != GRB.OPTIMAL:
-            raise RuntimeError(
-                'Integer restricted master was not solved to proven optimality; '
-                f'Gurobi status={model.Status}'
-            )
-
-        self.integerMaster = master
-        self.integerMasterT = master.getTValue()
-        selected = master.getSelectedIntegerColumns(includeEmpty=False)
-        self.selectedColumns = [column for _, _, column in selected]
-        return self.selectedColumns
-
-    def solve(self, outputFlag=0):
-        self._initializeWarmStart(outputFlag=outputFlag)
-        self.phaseOneIterations, status = self._solveCGPhase(phase=1, outputFlag=outputFlag)
-        if status != 'OPTIMAL':
-            self.status = f'PHASE1_{status}'
-            return self
-        artificial = self.master.getPhaseOneArtificialValue()
-        if artificial > self.phaseOneTolerance:
-            self.status = 'INFEASIBLE_BASE_ROUTING'
-            self.lowerBound = float('inf')
-            return self
-
-        totalPhaseTwoIterations = 0
-
-        for cutRound in range(self.maxBssCuts + 1):
-            cgIterations, status = self._solveCGPhase(phase=2, outputFlag=outputFlag)
-            totalPhaseTwoIterations += cgIterations
-            if status != 'OPTIMAL':
-                self.status = f'PHASE2_{status}'
-                self.phaseTwoIterations = totalPhaseTwoIterations
-                return self
-            self.lowerBound = self.master.getTValue()
-
-            selectedColumns = self._solveIntegerRestrictedMaster(outputFlag=outputFlag)
-            self.bssResult = self.bssScheduler.solve(
-                selectedColumns,
-                outputFlag=self._gurobiOutputFlag(outputFlag),
-                timeLimit=self.bssTimeLimit,
-                mipGap=0.0,
-            )
-            self.bssObjective = self.bssResult.objective
-
-            if not self.bssResult.provenOptimal:
-                self.status = 'BSS_SP_NOT_PROVEN_OPTIMAL'
-                self.phaseTwoIterations = totalPhaseTwoIterations
-                return self
-
-            if self.integerMasterT >= self.bssObjective - self.cutTolerance:
-                self.status = 'RMP_INTEGER_BSS_CONSISTENT'
-                self.phaseTwoIterations = totalPhaseTwoIterations
-                self.cutRounds = cutRound
-                return self
-
-            if cutRound >= self.maxBssCuts:
-                self.status = 'BSS_CUT_LIMIT'
-                self.phaseTwoIterations = totalPhaseTwoIterations
-                self.cutRounds = cutRound
-                return self
-
-            added = self._addOrStrengthenCut(selectedColumns, self.bssObjective)
-            if not added:
-                raise RuntimeError(
-                    'BSS underestimation persists but no stronger valid cut could be added'
-                )
-            self.cutRounds = cutRound + 1
-
-        self.phaseTwoIterations = totalPhaseTwoIterations
-        self.status = 'BSS_CUT_LIMIT'
-        return self
-
-    def getResult(self):
-        base = super().getResult()
-        base.update({
-            'cutCount': len(self.bssCuts),
-            'cutRounds': self.cutRounds,
-            'integerMasterT': self.integerMasterT,
-            'bssObjective': self.bssObjective,
-            'selectedRouteTasks': [tuple(column.tasks) for column in self.selectedColumns],
-            'bssStatus': self.bssResult.status if self.bssResult is not None else None,
-            'bssEvents': self.bssResult.events if self.bssResult is not None else [],
-            'exactnessNote': (
-                'Exact-label root pricing and fixed-combination BSS separation are exact; '
-                'global integer exactness still requires branch-and-price.'
-            ),
-        })
-        return base
 
 
 @dataclass(order=True)
@@ -646,37 +544,51 @@ class _QueueNode:
 
 class BranchPriceCutSolver(RootColumnGenerationSolver):
     """
-    V0.6 globally exact Branch-and-Price-and-Cut framework with slot-specific
-    successor-arc flow branching.
+    V0.20 Branch-and-Price-and-Cut framework with COMPLETE physical route
+    columns and slot-specific PHYSICAL-arc flow branching.
+
+    Column identity
+    ---------------
+    A route column is its full physical node sequence. Customer nodes are
+    elementary; the canonical physical BSS node S[0] may be visited repeatedly.
+    Thus (0,3,S,5,end) and (0,3,5,S,end) are different columns.
 
     Branch variable
     ---------------
         f^k_ij = sum_r a^r_ij x_kr,
-    where a^r_ij indicates adjacency in the ordered CUSTOMER sequence of route
-    r (start/customer/end graph; swap positions are not part of the column
-    identity). A fractional f^k_ij is branched to 0 and 1.
+    where a^r_ij=1 iff physical arc (i,j) appears in the complete route.
+    Therefore customer->BSS, BSS->customer and BSS->depot arcs are branchable
+    exactly like customer/customer or depot/customer arcs. A fractional
+    f^k_ij is branched to 0 and 1.
 
     Branch propagation to pricing
     -----------------------------
-    f^k_ij=0: slot-k pricing forbids successor arc (i,j).
-    f^k_ij=1: every slot-k route column must contain successor arc (i,j).
+    f^k_ij=0: slot-k pricing forbids physical arc (i,j).
+    f^k_ij=1: every slot-k route column must contain physical arc (i,j).
     Since sum_r x_kr=1, restricting the slot-k column universe in this way is
     exactly equivalent to the branch equations. No branch-row dual is needed.
+    Because a repeatable BSS can make two different complete route orders share
+    one physical-arc incidence vector, a customer-precedence branch ``i before j``
+    is used only when no fractional physical arc can separate a fractional master
+    point.  This fallback depends only on the customer visited set, so pricing
+    never stores the predecessor used to enter the BSS.
 
     Exactness
     ---------
     - every node LP is solved by exact elementary pricing;
     - branches partition the slot-labelled integer route space;
-    - at every integral routing solution, the BSS subproblem enumerates all
-      feasible swap placements and is required to be proven optimal;
+    - at every integral routing solution, each selected column already fixes
+      all BSS visits; the BSS subproblem schedules those fixed events on the
+      one physical swap server and must be proven optimal;
     - if the base master underestimates that routing combination, the global
       combinatorial BSS optimality cut is added and the same node is re-priced;
     - pruning uses only valid LP lower bounds versus a feasible BSS incumbent.
     - a directed savings warm start supplies initial columns/UB only; it never
       restricts pricing or changes lower bounds;
-    - pricing uses exact visited-set inclusion dominance by default;
+    - pricing uses exact unreachable-set inclusion dominance by default;
     - classical 3-row subset-row cuts strengthen fractional node LPs; their
-      duals are priced exactly through SRC parity state in every label;
+      duals are priced exactly by deriving SRC parity from unreachableMask,
+      without adding a parity field to the mathematical label;
     - open branch nodes are explored by best bound: the node with the smallest
       inherited valid LP lower bound is processed first. This changes only search
       order and does not alter any lower bound, cut, or pricing rule.
@@ -698,7 +610,6 @@ class BranchPriceCutSolver(RootColumnGenerationSolver):
         branchTolerance=1e-7,
         cutTolerance=1e-7,
         maxBssCuts=None,
-        maxExactRouteTasks=None,
         bssTimeLimit=None,
         dominanceMode='subset',
         useSavingsWarmStart=True,
@@ -718,6 +629,7 @@ class BranchPriceCutSolver(RootColumnGenerationSolver):
         shortRouteTaskThreshold=15,
         maxShortRouteColumns=1000,
         deduplicateSymmetricNodes=True,
+        printMasterDuals=False,
     ):
         super().__init__(
             modelData=modelData,
@@ -739,6 +651,7 @@ class BranchPriceCutSolver(RootColumnGenerationSolver):
             preGenerateShortRoutes=preGenerateShortRoutes,
             shortRouteTaskThreshold=shortRouteTaskThreshold,
             maxShortRouteColumns=maxShortRouteColumns,
+            printMasterDuals=printMasterDuals,
         )
 
         self.useSavingsIncumbent = bool(useSavingsIncumbent)
@@ -768,8 +681,6 @@ class BranchPriceCutSolver(RootColumnGenerationSolver):
         self.brancher = ArcFlowBrancher(modelData, tolerance=branchTolerance)
         self.bssScheduler = ExactBssScheduler(
             modelData=modelData,
-            sequenceEvaluator=self.sequenceEvaluator,
-            maxExactRouteTasks=maxExactRouteTasks,
             profiler=self.profiler,
         )
 
@@ -803,9 +714,6 @@ class BranchPriceCutSolver(RootColumnGenerationSolver):
         self._lastNodePhaseTwoIterations = 0
         self.searchStrategy = 'BEST_BOUND'
         self.deduplicateSymmetricNodes = bool(deduplicateSymmetricNodes)
-        self.symmetricNodesSkipped = 0
-        self.phaseOneSkipped = 0
-        self.phaseOneActivated = 0
 
     def _remainingTime(self):
         if self._deadline is None:
@@ -855,7 +763,7 @@ class BranchPriceCutSolver(RootColumnGenerationSolver):
             return
         width = 96
         print('=' * width)
-        print('BRANCH-AND-PRICE-AND-CUT'.center(width))
+        print('BRANCH-AND-PRICE-AND-CUT | COMPLETE ROUTE COLUMNS'.center(width))
         print('=' * width)
         print(
             f'Instance : tasks={len(self.data.C)}, vehicles={self.data.K}, '
@@ -868,8 +776,11 @@ class BranchPriceCutSolver(RootColumnGenerationSolver):
             f'timeLimit={_format_number(timeLimit, 1) + "s" if timeLimit is not None else "None"}'
         )
         print(
-            'Tree     : BEST-BOUND (min inherited LP lower bound first) | '
+            'Tree     : BEST-BOUND | branch=physical arcs; customer-precedence fallback | '
             f'symmetry-dedup={"ON" if self.deduplicateSymmetricNodes else "OFF"}'
+        )
+        print(
+            'Core     : RMP -> exact pricing -> integer? BSS separation/UB : branch'
         )
         print(
             f'RMP      : persistent/incremental | short-route warm pool<='
@@ -885,6 +796,8 @@ class BranchPriceCutSolver(RootColumnGenerationSolver):
             'Log level: 1=concise BPC, 2=+column generation details, '
             '3=+native Gurobi logs'
         )
+        if self.printMasterDuals:
+            print('Dual log : ON | print every solved RMP dual vector before pricing')
         print('-' * width)
 
     def _printNodeHeader(self, node, queueSize):
@@ -1112,12 +1025,6 @@ class BranchPriceCutSolver(RootColumnGenerationSolver):
             includeEmpty=False,
         )
 
-    def _selectedIntegralColumns(self):
-        return [
-            column
-            for _, _, column, _ in self._selectedIntegralEntries()
-        ]
-
     def _solveIntegralBss(self, selectedColumns, outputFlag):
         remaining = self._remainingTime()
         if self.bssTimeLimit is None:
@@ -1146,7 +1053,6 @@ class BranchPriceCutSolver(RootColumnGenerationSolver):
                 objective=0.0,
                 status='GREEDY_WARM_START',
                 provenOptimal=False,
-                selectedPlanIndexByRoute={},
                 routeCompletion={},
                 routeWaiting={},
                 events=[],
@@ -1157,12 +1063,12 @@ class BranchPriceCutSolver(RootColumnGenerationSolver):
         for r, column in enumerate(selectedColumns):
             routeEvents[r] = [
                 {
-                    'eventIndex': int(raw[0]),
-                    'afterTask': raw[1],
-                    'nominalArrival': float(raw[2]),
-                    'nominalEnd': float(raw[4]),
+                    'eventIndex': int(event.index),
+                    'afterTask': event.afterTask,
+                    'nominalArrival': float(event.arrivalTime),
+                    'nominalEnd': float(event.baseEndTime),
                 }
-                for raw in column.baseSwapEvents
+                for event in column.swapEvents
             ]
 
         nextEvent = {r: 0 for r in routeEvents}
@@ -1205,7 +1111,6 @@ class BranchPriceCutSolver(RootColumnGenerationSolver):
 
             events.append({
                 'routeIndex': r,
-                'planIndex': None,
                 'eventIndex': h,
                 'afterTask': event['afterTask'],
                 'arrivalTime': ready,
@@ -1225,7 +1130,6 @@ class BranchPriceCutSolver(RootColumnGenerationSolver):
             objective=float(objective),
             status='GREEDY_WARM_START',
             provenOptimal=False,
-            selectedPlanIndexByRoute={},
             routeCompletion=routeCompletion,
             routeWaiting=routeWaiting,
             events=events,
@@ -1292,6 +1196,103 @@ class BranchPriceCutSolver(RootColumnGenerationSolver):
                             f'isolatedBase={_format_number(column.duration, 3)}'
                         )
 
+    def _processIntegralMasterSolution(self, nodeLowerBound, outputFlag):
+        """Run the BSS separation step for one integral routing solution.
+
+        This is the only place where the routing master talks to the BSS
+        scheduling subproblem:
+
+            integral RMP solution
+                -> exact BSS schedule
+                -> feasible UB update
+                -> add one global BSS optimality cut iff RMP underestimates it.
+
+        Returns ``REPRICE`` after a newly added cut, ``FATHOM`` if the current
+        integer routing solution is already represented exactly by the master,
+        or ``STOP`` if exact BSS separation cannot be completed.
+        """
+        self.integralNodes += 1
+        selectedEntries = self._selectedIntegralEntries()
+        selectedColumns = [entry[2] for entry in selectedEntries]
+
+        if outputFlag:
+            print(
+                f'  [INTEGER] routing solution with {len(selectedColumns)} '
+                f'nonempty route(s)'
+            )
+            if outputFlag >= 2:
+                for slot, _, column, _ in selectedEntries:
+                    print(
+                        f'      V{slot + 1}: tasks={self._routeText(column)} | '
+                        f'isolatedBase={_format_number(column.duration, 3)}'
+                    )
+
+        bssResult = self._solveIntegralBss(
+            selectedColumns,
+            outputFlag=outputFlag,
+        )
+        if not bssResult.provenOptimal:
+            self._interrupted = True
+            self._interruptionStatus = 'BSS_SP_NOT_PROVEN_OPTIMAL'
+            if outputFlag:
+                print(
+                    f'  [STOP] BSS subproblem not proven optimal: '
+                    f'{bssResult.status}'
+                )
+            return 'STOP'
+
+        isolatedBase = max(
+            (column.duration for column in selectedColumns),
+            default=0.0,
+        )
+        bssUplift = max(0.0, bssResult.objective - isolatedBase)
+        if outputFlag:
+            print(
+                f'  [BSS] isolated-base Cmax={_format_number(isolatedBase, 3)} | '
+                f'true Cmax={_format_number(bssResult.objective, 3)} | '
+                f'uplift={_format_number(bssUplift, 3)} | '
+                f'status={bssResult.status}'
+            )
+
+        # The exact BSS schedule is feasible for the original problem, so it
+        # may improve the global upper bound immediately, even when a cut is
+        # still needed to lift the routing master at this integer combination.
+        self._updateIncumbent(selectedEntries, bssResult, outputFlag)
+
+        if nodeLowerBound < bssResult.objective - self.cutTolerance:
+            if self.maxBssCuts is not None and len(self.bssCuts) >= self.maxBssCuts:
+                self._interrupted = True
+                self._interruptionStatus = 'BSS_CUT_LIMIT'
+                if outputFlag:
+                    print('  [STOP] maximum number of BSS cuts reached')
+                return 'STOP'
+
+            added = self._addOrStrengthenCut(
+                selectedColumns,
+                bssResult.objective,
+            )
+            if not added:
+                raise RuntimeError(
+                    'Integral route combination is still underestimated '
+                    'but its exact BSS cut is already present.'
+                )
+
+            if outputFlag:
+                print(
+                    f'  [CUT #{len(self.bssCuts):04d}] '
+                    f'T >= {_format_number(bssResult.objective, 3)} '
+                    f'when physicalRoutes={ [tuple(c.nodes) for c in selectedColumns] }'
+                )
+                print('             -> re-solve RMP and re-price this branch node')
+            return 'REPRICE'
+
+        if outputFlag:
+            print(
+                '  [FATHOM] integral routing solution is BSS-consistent '
+                'at this node'
+            )
+        return 'FATHOM'
+
     def _getIncumbentRouteDetails(self):
         if self.incumbentBssResult is None or not self.incumbentColumns:
             return []
@@ -1303,22 +1304,9 @@ class BranchPriceCutSolver(RootColumnGenerationSolver):
                 if routeIndex < len(self.incumbentSlots)
                 else routeIndex
             )
-            selectedPlanIndex = self.incumbentBssResult.selectedPlanIndexByRoute.get(
-                routeIndex
-            )
-            plan = None
-            if selectedPlanIndex is not None:
-                plans = self.sequenceEvaluator.enumerateAllFeasiblePlans(column.tasks)
-                if 0 <= selectedPlanIndex < len(plans):
-                    plan = plans[selectedPlanIndex]
-
-            nodes = tuple(plan.nodes) if plan is not None else tuple(column.baseNodes)
+            nodes = tuple(column.nodes)
             pathText = ' -> '.join(self._nodeLabel(node) for node in nodes)
-            selectedPlanBase = float(plan.duration) if plan is not None else float(column.duration)
-            swapCount = int(plan.swapCount) if plan is not None else sum(
-                1 for node in nodes if node in self.data.S
-            )
-
+            baseDuration = float(column.duration)
             details.append({
                 'vehicleSlot': slot,
                 'vehicle': slot + 1,
@@ -1326,19 +1314,15 @@ class BranchPriceCutSolver(RootColumnGenerationSolver):
                 'tasks': tuple(column.tasks),
                 'nodes': nodes,
                 'path': pathText,
-                'isolatedMinimumBaseDuration': float(column.duration),
-                'selectedPlanBaseDuration': selectedPlanBase,
+                'baseDuration': baseDuration,
                 'completionTime': float(
-                    self.incumbentBssResult.routeCompletion.get(
-                        routeIndex,
-                        selectedPlanBase,
-                    )
+                    self.incumbentBssResult.routeCompletion.get(routeIndex, baseDuration)
                 ),
                 'waitingTime': float(
                     self.incumbentBssResult.routeWaiting.get(routeIndex, 0.0)
                 ),
-                'swapCount': swapCount,
-                'selectedPlanIndex': selectedPlanIndex,
+                'swapCount': int(column.stationVisitCount),
+                'columnSignature': tuple(column.signature),
             })
 
         return details
@@ -1410,6 +1394,7 @@ class BranchPriceCutSolver(RootColumnGenerationSolver):
             )
             print(
                 f"BSS           : total={_format_number(times.get('bssTotal', 0.0), 3)}s | "
+                f"enum={_format_number(times.get('bssEnumeration', 0.0), 3)}s | "
                 f"MIP={_format_number(times.get('bssMipOptimize', 0.0), 3)}s | "
                 f"cacheHit={counts.get('bssCacheHits', 0)} | "
                 f"cacheMiss={counts.get('bssCacheMisses', 0)}"
@@ -1427,8 +1412,7 @@ class BranchPriceCutSolver(RootColumnGenerationSolver):
             for route in routes:
                 print(
                     f"Vehicle {route['vehicle']:>2d} | tasks={list(route['tasks'])} | "
-                    f"base(min)={_format_number(route['isolatedMinimumBaseDuration'], digits)} | "
-                    f"base(chosen)={_format_number(route['selectedPlanBaseDuration'], digits)} | "
+                    f"base={_format_number(route['baseDuration'], digits)} | "
                     f"wait={_format_number(route['waitingTime'], digits)} | "
                     f"completion={_format_number(route['completionTime'], digits)} | "
                     f"swaps={route['swapCount']}"
@@ -1525,7 +1509,7 @@ class BranchPriceCutSolver(RootColumnGenerationSolver):
             self._interrupted = True
             self._interruptionStatus = 'TIME_LIMIT'
 
-        rootState = ArcBranchingState.root(self.data.K)
+        rootState = ArcBranchingState.root(self.data)
         queue = []
         root = _QueueNode(
             estimatedLowerBound=0.0,
@@ -1614,123 +1598,60 @@ class BranchPriceCutSolver(RootColumnGenerationSolver):
                         )
                     break
 
+                support = self.master.getPositiveX(
+                    tolerance=self.brancher.tolerance * 0.1
+                )
                 decision = self.brancher.choose(
                     self.master,
                     branchingState=node.branchingState,
+                    support=support,
                 )
 
                 if decision is None:
-                    if not self.brancher.isIntegral(self.master):
+                    if not self.brancher.isIntegral(self.master, support=support):
                         raise RuntimeError(
-                            'No fractional successor arc was found although the '
-                            'slot-column solution is fractional. This violates '
-                            'the branching completeness assumption.'
+                            'No physical-arc or customer-precedence branch decision was found '
+                            'although the slot-column solution is fractional.'
                         )
 
-                    self.integralNodes += 1
-                    selectedEntries = self._selectedIntegralEntries()
-                    selectedColumns = [entry[2] for entry in selectedEntries]
-
-                    if outputFlag:
-                        print(
-                            f'  [INTEGER] routing solution with {len(selectedColumns)} '
-                            f'nonempty route(s)'
-                        )
-                        if outputFlag >= 2:
-                            for slot, _, column, _ in selectedEntries:
-                                print(
-                                    f'      V{slot + 1}: tasks={self._routeText(column)} | '
-                                    f'isolatedBase={_format_number(column.duration, 3)}'
-                                )
-
-                    bssResult = self._solveIntegralBss(
-                        selectedColumns,
+                    action = self._processIntegralMasterSolution(
+                        nodeLowerBound=nodeLowerBound,
                         outputFlag=outputFlag,
                     )
-
-                    if not bssResult.provenOptimal:
-                        self._interrupted = True
-                        self._interruptionStatus = 'BSS_SP_NOT_PROVEN_OPTIMAL'
-                        if outputFlag:
-                            print(
-                                f'  [STOP] BSS subproblem not proven optimal: '
-                                f'{bssResult.status}'
-                            )
-                        break
-
-                    isolatedBase = max(
-                        (column.duration for column in selectedColumns),
-                        default=0.0,
-                    )
-                    bssUplift = max(0.0, bssResult.objective - isolatedBase)
-
-                    if outputFlag:
-                        print(
-                            f'  [BSS] isolated-base Cmax={_format_number(isolatedBase, 3)} | '
-                            f'true Cmax={_format_number(bssResult.objective, 3)} | '
-                            f'uplift={_format_number(bssUplift, 3)} | '
-                            f'status={bssResult.status}'
-                        )
-
-                    self._updateIncumbent(
-                        selectedEntries,
-                        bssResult,
-                        outputFlag,
-                    )
-
-                    if nodeLowerBound < bssResult.objective - self.cutTolerance:
-                        if self.maxBssCuts is not None and len(self.bssCuts) >= self.maxBssCuts:
-                            self._interrupted = True
-                            self._interruptionStatus = 'BSS_CUT_LIMIT'
-                            if outputFlag:
-                                print('  [STOP] maximum number of BSS cuts reached')
-                            break
-
-                        added = self._addOrStrengthenCut(
-                            selectedColumns,
-                            bssResult.objective,
-                        )
-                        if not added:
-                            raise RuntimeError(
-                                'Integral route combination is still underestimated '
-                                'but its exact BSS cut is already present.'
-                            )
-
-                        if outputFlag:
-                            print(
-                                f'  [CUT #{len(self.bssCuts):04d}] '
-                                f'T >= {_format_number(bssResult.objective, 3)} '
-                                f'when routes={ [tuple(c.tasks) for c in selectedColumns] }'
-                            )
-                            print('             -> re-price the same branch node')
-
-                        # Global valid cut: re-price this same branch node.
+                    if action == 'REPRICE':
+                        # The BSS cut is global and changes this node's RMP.
+                        # Keep the persistent master, synchronize the new cut,
+                        # then return to the exact RMP -> pricing loop.
                         continue
-
-                    if outputFlag:
-                        print(
-                            '  [FATHOM] integral routing solution is BSS-consistent '
-                            'at this node'
-                        )
                     break
 
-                # Fractional node: branch on f^k_ij closest to 0.5.
+                # Fractional node: branch first on complete-route physical arcs.
+                # If repeated visits to the same BSS create an arc-incidence
+                # degeneracy, fall back to a customer precedence indicator.
+                # This preserves exact branching without a station-entry label state.
                 slot = decision.slot
-                arc = decision.arc
                 flow = decision.flow
 
                 children = []
                 childDescriptions = []
                 for value in (0, 1):
-                    childState = node.branchingState.child(
-                        slot=slot,
-                        arc=arc,
-                        value=value,
-                        startNode=self.data.startNode,
-                        endNode=self.data.endNode,
-                    )
+                    if isinstance(decision, ArcBranchDecision):
+                        childState = node.branchingState.childArc(
+                            slot=slot,
+                            arc=decision.arc,
+                            value=value,
+                        )
+                    elif isinstance(decision, PrecedenceBranchDecision):
+                        childState = node.branchingState.childPrecedence(
+                            slot=slot,
+                            pair=decision.pair,
+                            value=value,
+                        )
+                    else:
+                        raise TypeError(f'Unsupported branch decision: {type(decision)!r}')
+
                     if childState is None:
-                        childDescriptions.append(f'f={value}:structurally infeasible')
+                        childDescriptions.append(f'value={value}:structurally infeasible')
                         continue
 
                     if self.deduplicateSymmetricNodes:
@@ -1738,7 +1659,7 @@ class BranchPriceCutSolver(RootColumnGenerationSolver):
                         if stateKey in seenBranchStateKeys:
                             self.symmetricNodesSkipped += 1
                             self.profiler.increment('symmetricNodesSkipped')
-                            childDescriptions.append(f'f={value}:symmetric duplicate')
+                            childDescriptions.append(f'value={value}:symmetric duplicate')
                             continue
                         seenBranchStateKeys.add(stateKey)
 
@@ -1750,12 +1671,9 @@ class BranchPriceCutSolver(RootColumnGenerationSolver):
                         parentId=node.nodeId,
                     )
                     children.append(child)
-                    childDescriptions.append(f'f={value}:node {nextNodeId}')
+                    childDescriptions.append(f'value={value}:node {nextNodeId}')
                     nextNodeId += 1
 
-                # Best-bound queue. Both children inherit the proven parent LP
-                # lower bound until they are explicitly re-priced. The min-heap
-                # decides which open node is processed next.
                 for child in children:
                     self.nodesCreated += 1
                     heapq.heappush(queue, child)
@@ -1763,13 +1681,18 @@ class BranchPriceCutSolver(RootColumnGenerationSolver):
                 self.branchCount += 1
 
                 if outputFlag:
-                    print(
-                        f'  [BRANCH] V{slot + 1} successor arc '
-                        f'{self._formatArc(arc)} has flow={flow:.6f}'
-                    )
-                    print(
-                        '           -> ' + ' | '.join(childDescriptions)
-                    )
+                    if isinstance(decision, ArcBranchDecision):
+                        print(
+                            f'  [BRANCH] V{slot + 1} physical arc '
+                            f'{self._formatArc(decision.arc)} has flow={flow:.6f}'
+                        )
+                    else:
+                        i, j = decision.pair
+                        print(
+                            f'  [BRANCH-ORDER] V{slot + 1} precedence '
+                            f'C{i} before C{j} has flow={flow:.6f}'
+                        )
+                    print('           -> ' + ' | '.join(childDescriptions))
                 break
 
             if self._interrupted:
@@ -1860,7 +1783,7 @@ class BranchPriceCutSolver(RootColumnGenerationSolver):
             'shortRouteColumnsAdded': self.shortRouteColumnsAdded,
             'shortRouteBuildTime': self.shortRouteBuildTime,
             'performanceProfile': self.profiler.snapshot(),
-            'cacheStatistics': collectCacheStatistics(self.sequenceEvaluator, self.bssScheduler),
+            'cacheStatistics': collectCacheStatistics(self.routeEvaluator, self.bssScheduler),
             'pricingStatistics': getattr(self.pricing, 'lastStatistics', None),
             'selectedRouteTasks': [tuple(c.tasks) for c in self.incumbentColumns],
             'routes': routes,
@@ -1876,9 +1799,8 @@ class BranchPriceCutSolver(RootColumnGenerationSolver):
                 else []
             ),
             'exactnessNote': (
-                'OPTIMAL is reported only after the branch queue is exhausted '
-                'with exact node pricing (including active SRC duals) and '
-                'proven-optimal BSS subproblems.'
+                'OPTIMAL is reported only after the branch queue is exhausted with exact '
+                'complete-route pricing (customers elementary, physical BSS repeatable), '
+                'active SRC duals handled in pricing, and proven-optimal fixed-event BSS scheduling.'
             ),
         }
-

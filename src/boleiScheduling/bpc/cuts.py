@@ -8,8 +8,8 @@ class BssOptimalityCut:
     """
     Combinatorial optimality cut for one integer route combination.
 
-    Let R* be the selected NONEMPTY route signatures and let T* be the proven
-    optimal single-BSS makespan for exactly those route sequences. The cut is
+    Let R* be the selected NONEMPTY COMPLETE-route signatures and let T* be the proven
+    optimal single-BSS makespan for exactly those fixed physical routes. The cut is
 
         T >= T* (sum_{r in R*} sum_k x[k,r] - |R*| + 1).
 

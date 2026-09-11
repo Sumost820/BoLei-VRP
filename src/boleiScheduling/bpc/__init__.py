@@ -1,19 +1,20 @@
-from .column import RouteColumn
-from .swap_dp import ExactFixedSequenceEvaluator
+from .column import RouteColumn, SwapEvent
+from .swap_dp import ExactCompleteRouteEvaluator
 from .master import RestrictedMasterProblem, PersistentRestrictedMasterProblem, MasterDuals
 from .pricing import ExactEnumerativePricing, ExactLabelingPricing, PricingCandidate, LabelingStatistics
 from .cuts import BssOptimalityCut, SubsetRowCut, SubsetRowViolation, ThreeRowSubsetCutSeparator
 from .bss import ExactBssScheduler, BssScheduleResult
-from .branch import ArcBranchingState, ArcBranchDecision, ArcFlowBrancher, route_sequence_arcs
+from .branch import ArcBranchingState, ArcBranchDecision, PrecedenceBranchDecision, ArcFlowBrancher
 from .savings import SavingsWarmStart, SavingsWarmStartResult
-from .solver import RootColumnGenerationSolver, RootBpcCutSolver, BranchPriceCutSolver
+from .solver import RootColumnGenerationSolver, BranchPriceCutSolver
 from .columnManager import ColumnManager
 from .profiler import PerformanceProfiler
 from .cache import collectCacheStatistics
 
 __all__ = [
     'RouteColumn',
-    'ExactFixedSequenceEvaluator',
+    'SwapEvent',
+    'ExactCompleteRouteEvaluator',
     'RestrictedMasterProblem',
     'PersistentRestrictedMasterProblem',
     'MasterDuals',
@@ -29,12 +30,11 @@ __all__ = [
     'BssScheduleResult',
     'ArcBranchingState',
     'ArcBranchDecision',
+    'PrecedenceBranchDecision',
     'ArcFlowBrancher',
-    'route_sequence_arcs',
     'SavingsWarmStart',
     'SavingsWarmStartResult',
     'RootColumnGenerationSolver',
-    'RootBpcCutSolver',
     'BranchPriceCutSolver',
     'ColumnManager',
     'PerformanceProfiler',

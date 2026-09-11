@@ -20,9 +20,9 @@ class SavingsWarmStart:
     """
     Multi-start directed Clarke-Wright-style warm start.
 
-    The warm start manipulates customer-only sequences. Every sequence that is
-    kept is evaluated by the exact fixed-sequence swap DP, so energy feasibility
-    and the isolated minimum base duration are exact for that sequence.
+    The warm start manipulates customer-only sequences. Every retained sequence
+    is passed to ``ExactCompleteRouteEvaluator.evaluate`` which returns the
+    isolated-best feasible complete physical route for that customer order.
 
     This is ONLY a primal/warm-start heuristic. It does not restrict the route
     universe and therefore cannot affect Branch-and-Price-and-Cut exactness.
@@ -41,7 +41,7 @@ class SavingsWarmStart:
     def __init__(
         self,
         modelData,
-        sequenceEvaluator,
+        routeEvaluator,
         starts=12,
         seed=1,
         randomization=0.20,
@@ -49,7 +49,7 @@ class SavingsWarmStart:
         maxInitialColumns=1000,
     ):
         self.data = modelData
-        self.sequenceEvaluator = sequenceEvaluator
+        self.routeEvaluator = routeEvaluator
         self.starts = max(1, int(starts))
         self.seed = int(seed)
         self.randomization = max(0.0, float(randomization))
@@ -66,7 +66,7 @@ class SavingsWarmStart:
         allColumns = {}
         solutions = []
 
-        empty = self.sequenceEvaluator.evaluate(())
+        empty = self.routeEvaluator.evaluate(())
         if empty is not None:
             allColumns[empty.signature] = empty
 
@@ -87,7 +87,7 @@ class SavingsWarmStart:
             routeColumns = []
             feasible = True
             for sequence in routes:
-                column = self.sequenceEvaluator.evaluate(sequence)
+                column = self.routeEvaluator.evaluate(sequence)
                 if column is None:
                     feasible = False
                     break
@@ -107,11 +107,13 @@ class SavingsWarmStart:
                 bestScore = score
                 bestRoutes = list(routeColumns)
 
-        # Protect all singleton columns and every route of the best warm-start
-        # solution before applying an optional initial-column cap.
-        protected = set(self._singletonColumns)
+        # Protect all singleton complete-route columns, the empty route, and
+        # every route of the best warm-start solution before applying a cap.
+        protected = {column.signature for column in self._singletonColumns.values()}
         protected.update(column.signature for column in bestRoutes)
-        protected.add(())
+        emptyColumn = self.routeEvaluator.evaluate(())
+        if emptyColumn is not None:
+            protected.add(emptyColumn.signature)
 
         columns = list(allColumns.values())
         columns.sort(
@@ -119,7 +121,7 @@ class SavingsWarmStart:
                 0 if column.signature in protected else 1,
                 len(column.tasks),
                 column.duration,
-                column.tasks,
+                column.nodes,
             )
         )
 
@@ -149,7 +151,7 @@ class SavingsWarmStart:
     def _prepareSingletons(self, allColumns):
         self._singletonColumns = {}
         for task in self.data.C:
-            column = self.sequenceEvaluator.evaluate((task,))
+            column = self.routeEvaluator.evaluate((task,))
             if column is None:
                 continue
             self._singletonColumns[task] = column
@@ -168,7 +170,7 @@ class SavingsWarmStart:
                 if colJ is None:
                     continue
 
-                merged = self.sequenceEvaluator.evaluate((i, j))
+                merged = self.routeEvaluator.evaluate((i, j))
                 if merged is None:
                     continue
 
@@ -216,16 +218,16 @@ class SavingsWarmStart:
                 continue
 
             mergedSequence = routeI + routeJ
-            mergedColumn = self.sequenceEvaluator.evaluate(mergedSequence)
+            mergedColumn = self.routeEvaluator.evaluate(mergedSequence)
             if mergedColumn is None:
                 continue
 
             oldColumns = [
-                self.sequenceEvaluator.evaluate(routeI),
-                self.sequenceEvaluator.evaluate(routeJ),
+                self.routeEvaluator.evaluate(routeI),
+                self.routeEvaluator.evaluate(routeJ),
             ]
             currentRouteColumns = [
-                self.sequenceEvaluator.evaluate(sequence)
+                self.routeEvaluator.evaluate(sequence)
                 for sequence in routes.values()
             ]
             currentScore = self._solutionScore(currentRouteColumns)
@@ -234,7 +236,7 @@ class SavingsWarmStart:
                 column
                 for rid, sequence in routes.items()
                 if rid not in (routeIdI, routeIdJ)
-                for column in [self.sequenceEvaluator.evaluate(sequence)]
+                for column in [self.routeEvaluator.evaluate(sequence)]
             ] + [mergedColumn]
             proposedScore = self._solutionScore(proposedColumns)
 
@@ -260,7 +262,7 @@ class SavingsWarmStart:
             bestMove = None
             routeItems = list(routes.items())
             currentColumns = [
-                self.sequenceEvaluator.evaluate(sequence)
+                self.routeEvaluator.evaluate(sequence)
                 for _, sequence in routeItems
             ]
             currentScore = self._solutionScore(currentColumns)
@@ -280,12 +282,12 @@ class SavingsWarmStart:
                     )
 
                     for mergedSequence in orientations:
-                        mergedColumn = self.sequenceEvaluator.evaluate(mergedSequence)
+                        mergedColumn = self.routeEvaluator.evaluate(mergedSequence)
                         if mergedColumn is None:
                             continue
 
                         proposedColumns = [
-                            self.sequenceEvaluator.evaluate(sequence)
+                            self.routeEvaluator.evaluate(sequence)
                             for rid, sequence in routeItems
                             if rid not in (firstId, secondId)
                         ] + [mergedColumn]

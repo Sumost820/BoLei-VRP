@@ -1,3 +1,4 @@
+from .columnManager import ColumnPrefixTrie
 import itertools
 from collections import deque
 from dataclasses import dataclass, field
@@ -28,45 +29,76 @@ class LabelingStatistics:
     perSlot: dict = field(default_factory=dict)
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class _PricingLabel:
+    """Four-field mathematical resource label.
+
+    ``unreachableMask`` is the elementary customer-inaccessibility set.  In the
+    current exact implementation it is exactly the set of already visited
+    customers: once a customer is served it is permanently unreachable.
+
+    Path reconstruction and optional cut/branch automata are deliberately kept
+    outside this object in ``_LabelRecord``.  They are implementation/control
+    metadata, not base VRP resources.
+    """
+
     currentNode: int
-    visitedMask: int
-    lastTask: object
-    duration: float
     remainingEnergy: float
-    partialReducedCost: float = 0.0
-    remainingPositiveDual: float = 0.0
-    requiredMask: int = 0
-    srcParityMask: int = 0
+    partialReducedCost: float
+    unreachableMask: int
+
+
+@dataclass(slots=True)
+class _LabelRecord:
+    """Operational wrapper around the four-field mathematical label.
+
+    ``existingPrefixState`` is auxiliary exact-duplicate-exclusion metadata.
+    It carries no reduced-cost term and no BSS dual.  The mathematical pricing
+    label remains the four fields in ``_PricingLabel``.
+    """
+
+    label: _PricingLabel
     predecessor: object = None
-    addedTask: object = None
+    addedNode: object = None
+    existingPrefixState: int = -1
     active: bool = True
 
 
 class _MaskIndexedDominanceBucket:
-    """Exact visited-set dominance indexed by bit mask.
+    """Exact inaccessible-set dominance indexed by an integer bit mask.
 
-    One Pareto front is stored per exact visited mask.  Candidate masks are
-    organized by cardinality, so subset dominance first filters at the *mask*
-    level and only then performs energy/reduced-cost comparisons on the Pareto
-    labels attached to compatible masks.  For dense buckets the code can also
-    enumerate actual submasks/supersets and do O(1) dictionary lookups.
+    One Pareto front is stored per exact ``unreachableMask``.  Candidate masks
+    are filtered by set inclusion before energy/reduced-cost comparisons.  Any
+    optional branch/cut state that truly changes future continuations belongs in
+    the bucket key or in the protected-prefix compatibility test, never in the
+    four-field core label.
     """
 
     def __init__(self, allTaskMask, mode, tolerance):
         self.allTaskMask = int(allTaskMask)
         self.mode = mode
         self.tolerance = float(tolerance)
-        self.fronts = {}              # visitedMask -> [active Pareto labels]
-        self.masksByCount = {}        # popcount -> set(visitedMask)
+        self.fronts = {}
+        self.masksByCount = {}
 
     def _resourceDominates(self, a, b, stats):
         stats['dominanceResourceComparisons'] += 1
         tol = self.tolerance
+        # DEAD means this physical prefix can no longer become any column
+        # already present in the global pool.  Such a genuinely-new prefix can
+        # safely dominate a live existing-column prefix.  Two live prefixes are
+        # comparable only when they are the same trie state; otherwise one may
+        # terminate at an excluded existing column while the other remains new.
+        noveltyCompatible = (
+            a.existingPrefixState == ColumnPrefixTrie.DEAD
+            or a.existingPrefixState == b.existingPrefixState
+        )
+        la = a.label
+        lb = b.label
         return (
-            a.remainingEnergy >= b.remainingEnergy - tol
-            and a.partialReducedCost <= b.partialReducedCost + tol
+            noveltyCompatible
+            and la.remainingEnergy >= lb.remainingEnergy - tol
+            and la.partialReducedCost <= lb.partialReducedCost + tol
         )
 
     @staticmethod
@@ -152,17 +184,15 @@ class _MaskIndexedDominanceBucket:
                 if (mask & oldMask) == mask:
                     yield oldMask
 
-    def insert(self, newLabel, queue, stats):
-        newMask = newLabel.visitedMask
+    def insert(self, newRecord, queue, stats):
+        newMask = newRecord.label.unreachableMask
 
         for oldMask in self._candidateSubsetMasks(newMask, stats):
             for old in self.fronts.get(oldMask, ()):
-                if old.active and self._resourceDominates(old, newLabel, stats):
+                if old.active and self._resourceDominates(old, newRecord, stats):
                     stats['dominatedLabels'] += 1
                     return False
 
-        # Materialize the mask list because fronts/masksByCount can change while
-        # dominated fronts are removed.
         supersetMasks = tuple(self._candidateSupersetMasks(newMask, stats))
         for oldMask in supersetMasks:
             oldFront = self.fronts.get(oldMask)
@@ -172,7 +202,7 @@ class _MaskIndexedDominanceBucket:
             for old in oldFront:
                 if not old.active:
                     continue
-                if self._resourceDominates(newLabel, old, stats):
+                if self._resourceDominates(newRecord, old, stats):
                     old.active = False
                     stats['removedByDominance'] += 1
                 else:
@@ -186,8 +216,8 @@ class _MaskIndexedDominanceBucket:
         if newMask not in self.fronts:
             self._registerMask(newMask)
             self.fronts[newMask] = []
-        self.fronts[newMask].append(newLabel)
-        queue.append(newLabel)
+        self.fronts[newMask].append(newRecord)
+        queue.append(newRecord)
         return True
 
     @property
@@ -196,214 +226,276 @@ class _MaskIndexedDominanceBucket:
 
 
 class ExactEnumerativePricing:
-    """Exhaustive small-instance pricing oracle, branch- and SRC-aware."""
+    """Exact small-N oracle over COMPLETE physical route columns.
 
-    def __init__(
-        self,
-        modelData,
-        sequenceEvaluator,
-        maxEnumeratedTasks=9,
-        reducedCostTolerance=1e-8,
-    ):
-        self.data = modelData
-        self.sequenceEvaluator = sequenceEvaluator
-        self.maxEnumeratedTasks = maxEnumeratedTasks
-        self.reducedCostTolerance = reducedCostTolerance
-        self.lastStatistics = None
-
-    def price(
-        self,
-        duals,
-        existingSignatures,
-        maxColumns=None,
-        branchingState=None,
-    ):
-        if len(self.data.C) > self.maxEnumeratedTasks:
-            raise ValueError(
-                f'ExactEnumerativePricing is a reference oracle for small N. '
-                f'N={len(self.data.C)} exceeds maxEnumeratedTasks='
-                f'{self.maxEnumeratedTasks}.'
-            )
-
-        existingSignatures = set(existingSignatures)
-        negative = []
-        evaluated = 0
-        branchRejected = 0
-
-        tasks = tuple(self.data.C)
-        for length in range(1, len(tasks) + 1):
-            for sequence in itertools.permutations(tasks, length):
-                if sequence in existingSignatures:
-                    continue
-
-                compatibleSlots = []
-                for k in range(self.data.K):
-                    if branchingState is None or branchingState.isSequenceCompatible(
-                        k,
-                        sequence,
-                        self.data.startNode,
-                        self.data.endNode,
-                    ):
-                        compatibleSlots.append(k)
-
-                if not compatibleSlots:
-                    branchRejected += 1
-                    continue
-
-                column = self.sequenceEvaluator.evaluate(sequence)
-                if column is None:
-                    continue
-                evaluated += 1
-
-                dualCoverage = sum(duals.coverage[i] for i in sequence)
-                srcReducedCost = 0.0
-                for cut, eta in getattr(duals, 'src', {}).items():
-                    eta = float(eta)
-                    if eta > 1e-8:
-                        raise RuntimeError(
-                            f'SRC dual must be nonpositive, got {eta} for {cut}'
-                        )
-                    eta = min(0.0, eta)
-                    srcReducedCost += (-eta) * cut.coefficient(column)
-
-                rcBySlot = {}
-                for k in compatibleSlots:
-                    beta = max(0.0, float(duals.makespan[k]))
-                    rcBySlot[k] = (
-                        beta * column.duration
-                        - dualCoverage
-                        - float(duals.slot[k])
-                        + srcReducedCost
-                    )
-
-                bestSlot = min(rcBySlot, key=rcBySlot.get)
-                bestRc = rcBySlot[bestSlot]
-                if bestRc < -self.reducedCostTolerance:
-                    negative.append(
-                        PricingCandidate(
-                            column=column,
-                            bestSlot=bestSlot,
-                            reducedCost=bestRc,
-                            reducedCostBySlot=rcBySlot,
-                        )
-                    )
-
-        negative.sort(
-            key=lambda candidate: (
-                candidate.reducedCost,
-                candidate.column.duration,
-                candidate.column.tasks,
-            )
-        )
-        if maxColumns is not None:
-            negative = negative[:maxColumns]
-
-        self.lastStatistics = {
-            'mode': 'enumerative',
-            'evaluatedFeasibleSequences': evaluated,
-            'branchRejectedSequences': branchRejected,
-            'negativeColumnsReturned': len(negative),
-        }
-        return negative
-
-
-class ExactLabelingPricing:
-    """Exact elementary pricing with mask-indexed set-inclusion dominance.
-
-    For labels sharing current physical node, compressed last customer,
-    required-arc state and active-SRC parity state, A dominates B when
-
-        visited(A) subseteq visited(B),
-        energy(A) >= energy(B),
-        partialRC(A) <= partialRC(B).
-
-    The implementation is exact.  The only change from the previous strong
-    dominance rule is the indexing data structure used to find comparable
-    visited masks efficiently.
+    Customer orders are enumerated exhaustively and, for each order, every
+    feasible BSS placement is enumerated.  The oracle is intentionally only a
+    validation/reference implementation for small instances.
     """
 
     def __init__(
         self,
         modelData,
-        sequenceEvaluator,
+        routeEvaluator,
+        maxEnumeratedTasks=9,
+        reducedCostTolerance=1e-8,
+    ):
+        self.data = modelData
+        self.routeEvaluator = routeEvaluator
+        self.maxEnumeratedTasks = maxEnumeratedTasks
+        self.reducedCostTolerance = reducedCostTolerance
+        self.lastStatistics = None
+
+    def price(self, duals, existingSignatures, maxColumns=None, branchingState=None):
+        if len(self.data.C) > self.maxEnumeratedTasks:
+            raise ValueError(
+                f'ExactEnumerativePricing is a small-N reference oracle. '
+                f'N={len(self.data.C)} exceeds maxEnumeratedTasks={self.maxEnumeratedTasks}.'
+            )
+
+        if hasattr(existingSignatures, 'signatureToIndex'):
+            existingSignatureIndex = existingSignatures.signatureToIndex
+        else:
+            existingSignatureIndex = {tuple(sig): None for sig in existingSignatures}
+        negative = []
+        evaluated = 0
+        branchRejected = 0
+        tasks = tuple(self.data.C)
+
+        for length in range(1, len(tasks) + 1):
+            for sequence in itertools.permutations(tasks, length):
+                for column in self.routeEvaluator.enumerateAllFeasiblePlans(sequence):
+                    signature = tuple(column.signature)
+                    if signature in existingSignatureIndex:
+                        continue
+                    compatibleSlots = [
+                        k for k in range(self.data.K)
+                        if branchingState is None or branchingState.isColumnCompatible(k, column)
+                    ]
+                    if not compatibleSlots:
+                        branchRejected += 1
+                        continue
+
+                    evaluated += 1
+                    dualCoverage = sum(float(duals.coverage[i]) for i in column.tasks)
+                    srcReducedCost = 0.0
+                    for cut, eta in getattr(duals, 'src', {}).items():
+                        eta = float(eta)
+                        if eta > 1e-8:
+                            raise RuntimeError(f'SRC dual must be nonpositive, got {eta} for {cut}')
+                        srcReducedCost += (-min(0.0, eta)) * cut.coefficient(column)
+
+                    rcBySlot = {}
+                    for k in compatibleSlots:
+                        beta = max(0.0, float(duals.makespan[k]))
+                        rcBySlot[k] = (
+                            beta * column.duration
+                            - dualCoverage
+                            - float(duals.slot[k])
+                            + srcReducedCost
+                        )
+                    bestSlot = min(rcBySlot, key=rcBySlot.get)
+                    bestRc = rcBySlot[bestSlot]
+                    if bestRc < -self.reducedCostTolerance:
+                        negative.append(PricingCandidate(
+                            column=column,
+                            bestSlot=bestSlot,
+                            reducedCost=bestRc,
+                            reducedCostBySlot=rcBySlot,
+                        ))
+
+        bestBySignature = {}
+        for candidate in negative:
+            sig = tuple(candidate.column.signature)
+            incumbent = bestBySignature.get(sig)
+            if incumbent is None or candidate.reducedCost < incumbent.reducedCost:
+                bestBySignature[sig] = candidate
+        negative = list(bestBySignature.values())
+        negative.sort(key=lambda c: (c.reducedCost, c.column.duration, c.column.nodes))
+        if maxColumns is not None:
+            negative = negative[:maxColumns]
+
+        self.lastStatistics = {
+            'mode': 'enumerative_complete_routes',
+            'evaluatedFeasibleCompleteRoutes': evaluated,
+            'branchRejectedCompleteRoutes': branchRejected,
+            'negativeColumnsReturned': len(negative),
+            'branchingProjection': 'physical_arcs+customer_precedence_fallback',
+        }
+        return negative
+
+
+class ExactLabelingPricing:
+    """Exact elementary-customer labeling over complete physical routes.
+
+    The mathematical resource label has exactly four fields:
+
+        (currentNode, remainingEnergy, partialReducedCost, unreachableMask).
+
+    ``unreachableMask`` is the elementary inaccessible-customer set and is
+    currently exactly the set of customers already visited by the partial
+    route.  The repeatable physical BSS is never inserted into this mask.
+
+    Branch/cut mechanisms are projected onto those four resources whenever
+    possible:
+
+    * forbidden/required physical arcs are enforced by local successor/
+      predecessor restrictions plus a mandatory-customer completion check;
+    * customer precedence is checked from ``unreachableMask`` and mandatory
+      progress is derived from that same mask;
+    * divisor-2 SRC reduced-cost increments are derived from the parity of
+      ``unreachableMask & cutMask`` -- no SRC parity field is stored;
+    * BSS combinatorial cuts are master-only rows. Their duals are deliberately
+      absent from pricing because every genuinely new route has coefficient 0
+      in every previously generated combination-specific BSS cut;
+    * exclusion of columns already present in the global pool is handled by an
+      incremental prefix trie in ``_LabelRecord``.  This carries no dual and is
+      not a mathematical resource.
+
+    With no mandatory-branch progress, exact
+    dominance is the classical relation at one current node:
+
+        unreachable(A) subseteq unreachable(B),
+        energy(A) >= energy(B),
+        reducedCost(A) <= reducedCost(B).
+    """
+
+    CORE_LABEL_STATE = (
+        'currentNode',
+        'remainingEnergy',
+        'partialReducedCost',
+        'unreachableMask',
+    )
+
+    def __init__(
+        self,
+        modelData,
+        routeEvaluator,
         reducedCostTolerance=1e-8,
         dominanceTolerance=1e-10,
         dualSignTolerance=1e-8,
         dominanceMode='subset',
     ):
         self.data = modelData
-        self.sequenceEvaluator = sequenceEvaluator
-        self.reducedCostTolerance = reducedCostTolerance
-        self.dominanceTolerance = dominanceTolerance
-        self.dualSignTolerance = dualSignTolerance
+        self.routeEvaluator = routeEvaluator
+        self.reducedCostTolerance = float(reducedCostTolerance)
+        self.dominanceTolerance = float(dominanceTolerance)
+        self.dualSignTolerance = float(dualSignTolerance)
         if dominanceMode not in ('subset', 'equal'):
             raise ValueError("dominanceMode must be 'subset' or 'equal'")
         self.dominanceMode = dominanceMode
         self.stationNode = modelData.S[0]
         self.tasks = tuple(modelData.C)
-        self.taskToBit = {
-            task: 1 << index
-            for index, task in enumerate(self.tasks)
-        }
+        self.taskToBit = {task: 1 << index for index, task in enumerate(self.tasks)}
         self.allTaskMask = (1 << len(self.tasks)) - 1
         self.lastStatistics = None
 
-    def price(
-        self,
-        duals,
-        existingSignatures,
-        maxColumns=None,
-        branchingState=None,
-    ):
-        existingSignatures = set(existingSignatures)
-        discoveredSlotsBySequence = {}
-        aggregate = LabelingStatistics()
+    def _normalizeExistingColumns(self, existingSignatures):
+        """Return the full duplicate index plus an optional ColumnManager.
 
-        activeSrcCuts = []
-        allSrcDuals = getattr(duals, 'src', {})
-        for cut, eta in allSrcDuals.items():
+        Production BPC passes the global ``ColumnManager``.  For standalone
+        callers that only provide signatures we conservatively protect every
+        existing signature because we cannot inspect its base reduced cost.
+        """
+        if hasattr(existingSignatures, 'signatureToIndex'):
+            return existingSignatures.signatureToIndex, existingSignatures, None
+
+        index = {tuple(sig): None for sig in existingSignatures}
+        trie = ColumnPrefixTrie()
+        for signature in index:
+            trie.insert(signature)
+        return index, None, trie
+
+    def _buildExistingExclusionTrieForSlot(
+        self,
+        manager,
+        fallbackTrie,
+        duals,
+        slot,
+        branchingState,
+    ):
+        """Protect only existing routes with negative *base* reduced cost.
+
+        BSS-cut duals are intentionally omitted from pricing.  At an optimal
+        node RMP, any existing compatible column whose base reduced cost is
+        nonnegative cannot invalidate dominance of a genuinely new negative
+        route.  The only dangerous existing columns are therefore those whose
+        base reduced cost is negative after removing the master-only BSS terms.
+
+        This selection uses only normal pricing duals and the existing columns;
+        it does not inspect BSS cuts or their duals.
+        """
+        if manager is None:
+            return fallbackTrie, max(0, len(fallbackTrie.children) - 1)
+
+        trie = ColumnPrefixTrie()
+        beta = max(0.0, float(duals.makespan[slot]))
+        sigma = float(duals.slot[slot])
+        srcDuals = getattr(duals, 'src', {})
+        protected = 0
+
+        routeIndices = manager.compatibleIndices(branchingState, slot)
+        for routeIndex in routeIndices:
+            column = manager.columns[routeIndex]
+            if column.isEmpty:
+                continue
+            dualCoverage = sum(float(duals.coverage[i]) for i in column.tasks)
+            srcReducedCost = 0.0
+            for cut, eta in srcDuals.items():
+                srcReducedCost += (-min(0.0, float(eta))) * cut.coefficient(column)
+            baseRc = beta * float(column.duration) - dualCoverage - sigma + srcReducedCost
+            if baseRc < -self.reducedCostTolerance:
+                trie.insert(column.signature)
+                protected += 1
+        return trie, protected
+
+    def _activeSrcCuts(self, duals):
+        active = []
+        for cut, eta in getattr(duals, 'src', {}).items():
             eta = float(eta)
             if eta > self.dualSignTolerance:
                 raise RuntimeError(
                     'SRC dual eta_S must be nonpositive for exact pricing, '
                     f'but got eta={eta} for subset {cut.customers}.'
                 )
-            eta = min(0.0, eta)
-            rho = -eta
-            if rho > self.dualSignTolerance:
-                activeSrcCuts.append((cut, rho))
+            rho = -min(0.0, eta)
+            if rho <= self.dualSignTolerance:
+                continue
+            cutMask = 0
+            for task in cut.customers:
+                cutMask |= self.taskToBit.get(task, 0)
+            active.append((cut, float(rho), cutMask))
+        return active
 
-        # Price vehicle slots in a deterministic promising order, but do not
-        # solve every slot eagerly.  Route columns are global: once any slot
-        # produces an improving route, adding that route creates x[k,r] for all
-        # compatible slots in the master, so it is safe (and much cheaper) to
-        # re-optimize the RMP immediately and postpone the remaining slots to
-        # the next CG round.
-        #
-        # A fully priced slot a can also certify another slot b without solving
-        # b when:
-        #   F_b subseteq F_a, beta_a <= beta_b, sigma_a >= sigma_b.
-        # Then rc_a(r) <= rc_b(r) for every route feasible for b.  Hence if a
-        # has been exhaustively priced, b cannot contain an improving route not
-        # already exposed by a.
+
+    def price(self, duals, existingSignatures, maxColumns=None, branchingState=None):
+        existingSignatureIndex, existingManager, fallbackExistingTrie = (
+            self._normalizeExistingColumns(existingSignatures)
+        )
+
+        activeSrcCuts = self._activeSrcCuts(duals)
+
+        # BSS cuts are master-only.  Their duals are not part of route reduced
+        # cost because every route not already in the master has coefficient 0
+        # in every previously generated combination-specific BSS cut.  The
+        # existing-column trie is still required for exact exclusion: an
+        # already-present route must not act as a zero-penalty "ghost" label
+        # that suppresses a genuinely new route under dominance.
+
+        discoveredSlotsBySignature = {}
+        aggregate = LabelingStatistics()
         slotOrder = self._slotSearchOrder(duals, branchingState)
         certifiedSlots = []
         skippedDominatedSlots = {}
         stoppedAfterImprovingSlot = False
+        maxExistingPrefixTrieStates = 1
+        protectedExistingColumns = 0
 
         for k in slotOrder:
-            certifier = next(
-                (
-                    a for a in certifiedSlots
-                    if self._slotCanCertify(
-                        certifier=a,
-                        target=k,
-                        duals=duals,
-                        branchingState=branchingState,
-                    )
-                ),
-                None,
-            )
+            certifier = next((
+                a for a in certifiedSlots
+                if self._slotCanCertify(a, k, duals, branchingState)
+            ), None)
             if certifier is not None:
                 skippedDominatedSlots[k] = certifier
                 aggregate.perSlot[k] = {
@@ -416,24 +508,38 @@ class ExactLabelingPricing:
             beta = float(duals.makespan[k])
             if beta < -self.dualSignTolerance:
                 raise RuntimeError(
-                    'Makespan dual beta_k must be nonnegative for the exact '
-                    f'dominance rule, but slot {k} has beta={beta}. Check the '
-                    'master constraint orientation.'
+                    'Makespan dual beta_k must be nonnegative, '
+                    f'but slot {k} has beta={beta}.'
                 )
             beta = max(0.0, beta)
 
-            sequences, slotStats = self._priceSlot(
+            existingPrefixTrie, protectedCount = (
+                self._buildExistingExclusionTrieForSlot(
+                    existingManager,
+                    fallbackExistingTrie,
+                    duals,
+                    k,
+                    branchingState,
+                )
+            )
+            protectedExistingColumns += protectedCount
+            maxExistingPrefixTrieStates = max(
+                maxExistingPrefixTrieStates, existingPrefixTrie.stateCount
+            )
+
+            signatures, slotStats = self._priceSlot(
                 slot=k,
                 beta=beta,
                 coverageDuals=duals.coverage,
                 slotDual=float(duals.slot[k]),
-                existingSignatures=existingSignatures,
+                existingSignatureIndex=existingSignatureIndex,
+                existingPrefixTrie=existingPrefixTrie,
                 branchingState=branchingState,
                 activeSrcCuts=activeSrcCuts,
                 targetNegativeColumns=maxColumns,
             )
-            for sequence in sequences:
-                discoveredSlotsBySequence.setdefault(sequence, set()).add(k)
+            for signature in signatures:
+                discoveredSlotsBySignature.setdefault(signature, set()).add(k)
 
             aggregate.perSlot[k] = slotStats
             for fieldName in (
@@ -448,44 +554,30 @@ class ExactLabelingPricing:
                     getattr(aggregate, fieldName) + int(slotStats.get(fieldName, 0)),
                 )
 
-            # Only an exhaustive slot solve can certify other slots.  If the
-            # per-slot search hit its batch limit, it deliberately stopped early.
             if not slotStats.get('earlyStopped', False):
                 certifiedSlots.append(k)
-
-            # In ordinary batched column generation, one improving slot is
-            # enough for this round.  Re-solve the persistent RMP now rather
-            # than paying for K independent pricing runs under stale duals.
-            if sequences and maxColumns is not None:
+            if signatures and maxColumns is not None:
                 stoppedAfterImprovingSlot = True
                 break
 
-        # Labeling can terminate early after collecting a batch of improving
-        # sequences.  Each sequence is then confirmed with the exact fixed-order
-        # swap optimizer, so the master always receives the true minimum base
-        # duration for that customer order.
+        allSrcDuals = getattr(duals, 'src', {})
         negative = []
-        for sequence in discoveredSlotsBySequence:
-            if sequence in existingSignatures:
+        for signature in discoveredSlotsBySignature:
+            if signature in existingSignatureIndex:
                 continue
-
-            column = self.sequenceEvaluator.evaluate(sequence)
+            column = self.routeEvaluator.evaluateNodes(signature)
             if column is None:
                 continue
 
-            dualCoverage = sum(duals.coverage[i] for i in sequence)
+            dualCoverage = sum(float(duals.coverage[i]) for i in column.tasks)
             srcReducedCost = 0.0
             for cut, eta in allSrcDuals.items():
-                eta = min(0.0, float(eta))
-                srcReducedCost += (-eta) * cut.coefficient(column)
-
+                srcReducedCost += (-min(0.0, float(eta))) * cut.coefficient(column)
             rcBySlot = {}
             for k in range(self.data.K):
-                if branchingState is not None and not branchingState.isSequenceCompatible(
-                    k,
-                    sequence,
-                    self.data.startNode,
-                    self.data.endNode,
+                if (
+                    branchingState is not None
+                    and not branchingState.isColumnCompatible(k, column)
                 ):
                     continue
                 beta = max(0.0, float(duals.makespan[k]))
@@ -495,34 +587,26 @@ class ExactLabelingPricing:
                     - float(duals.slot[k])
                     + srcReducedCost
                 )
-
             if not rcBySlot:
                 continue
             bestSlot = min(rcBySlot, key=rcBySlot.get)
             bestRc = rcBySlot[bestSlot]
             if bestRc < -self.reducedCostTolerance:
-                negative.append(
-                    PricingCandidate(
-                        column=column,
-                        bestSlot=bestSlot,
-                        reducedCost=bestRc,
-                        reducedCostBySlot=rcBySlot,
-                    )
-                )
+                negative.append(PricingCandidate(
+                    column=column,
+                    bestSlot=bestSlot,
+                    reducedCost=bestRc,
+                    reducedCostBySlot=rcBySlot,
+                ))
 
-        negative.sort(
-            key=lambda candidate: (
-                candidate.reducedCost,
-                candidate.column.duration,
-                candidate.column.tasks,
-            )
-        )
+        negative.sort(key=lambda c: (c.reducedCost, c.column.duration, c.column.nodes))
         if maxColumns is not None:
             negative = negative[:maxColumns]
 
         self.lastStatistics = {
-            'mode': 'exact_labeling',
+            'mode': 'exact_labeling_complete_routes',
             'dominanceMode': self.dominanceMode,
+            'coreLabelState': self.CORE_LABEL_STATE,
             'generatedLabels': aggregate.generatedLabels,
             'acceptedLabels': aggregate.acceptedLabels,
             'dominatedLabels': aggregate.dominatedLabels,
@@ -536,56 +620,42 @@ class ExactLabelingPricing:
             'dominanceMaskLookups': aggregate.dominanceMaskLookups,
             'dominanceResourceComparisons': aggregate.dominanceResourceComparisons,
             'earlyStopped': any(
-                slot.get('earlyStopped', False)
-                for slot in aggregate.perSlot.values()
+                s.get('earlyStopped', False) for s in aggregate.perSlot.values()
             ),
             'negativeColumnsReturned': len(negative),
             'activeSrcDuals': len(activeSrcCuts),
+            'bssCutsInPricing': 0,
             'slotOrder': tuple(slotOrder),
             'pricedSlots': tuple(
-                k for k in slotOrder if k in aggregate.perSlot
+                k for k in slotOrder
+                if k in aggregate.perSlot
                 and not aggregate.perSlot[k].get('skippedByVehicleDominance', False)
             ),
             'skippedDominatedSlots': dict(skippedDominatedSlots),
             'stoppedAfterImprovingSlot': stoppedAfterImprovingSlot,
             'queueMode': 'fifo',
+            'columnIdentity': 'complete_physical_nodes',
+            'branchingProjection': 'physical_arcs+customer_precedence_fallback',
+            'existingPrefixTrieStates': maxExistingPrefixTrieStates,
+            'protectedExistingColumns': protectedExistingColumns,
             'perSlot': aggregate.perSlot,
         }
         return negative
 
     def _slotSearchOrder(self, duals, branchingState):
-        """Heuristic order only; it never removes a slot by itself.
-
-        For d >= 0, smaller beta and larger sigma make
-            beta*d - sigma
-        more favorable.  Less-restricted slots are used as a final tie-break
-        because they are more likely to expose globally reusable route columns.
-        """
         def key(k):
             beta = max(0.0, float(duals.makespan[k]))
             sigma = float(duals.slot[k])
-            if branchingState is None:
-                restrictions = 0
-            else:
-                restrictions = (
-                    len(branchingState.requiredArcs(k))
-                    + len(branchingState.forbiddenArcs(k))
-                )
+            restrictions = 0 if branchingState is None else (
+                len(branchingState.requiredArcs(k))
+                + len(branchingState.forbiddenArcs(k))
+                + len(branchingState.requiredPrecedences(k))
+                + len(branchingState.forbiddenPrecedences(k))
+            )
             return (beta, -sigma, restrictions, k)
-
         return sorted(range(self.data.K), key=key)
 
     def _slotCanCertify(self, certifier, target, duals, branchingState):
-        """Return True iff an exhaustively priced slot certifies `target`.
-
-        Let F_k be the set of branch-compatible routes of slot k.  If
-            F_target subseteq F_certifier,
-            beta_certifier <= beta_target,
-            sigma_certifier >= sigma_target,
-        then rc_certifier(r) <= rc_target(r) for every r in F_target because
-        coverage and SRC contributions are slot independent and d_r >= 0.
-        Thus exhaustive pricing of `certifier` makes pricing `target` redundant.
-        """
         tol = self.dualSignTolerance
         betaA = max(0.0, float(duals.makespan[certifier]))
         betaB = max(0.0, float(duals.makespan[target]))
@@ -593,21 +663,9 @@ class ExactLabelingPricing:
         sigmaB = float(duals.slot[target])
         if betaA > betaB + tol or sigmaA < sigmaB - tol:
             return False
-
         if branchingState is None:
             return True
-
-        requiredA = branchingState.requiredArcs(certifier)
-        requiredB = branchingState.requiredArcs(target)
-        forbiddenA = branchingState.forbiddenArcs(certifier)
-        forbiddenB = branchingState.forbiddenArcs(target)
-
-        # F_B subseteq F_A when A requires no more arcs than B and A forbids
-        # no more arcs than B.
-        return (
-            requiredA.issubset(requiredB)
-            and forbiddenA.issubset(forbiddenB)
-        )
+        return branchingState.slotFeasibleSetContains(certifier, target)
 
     def _priceSlot(
         self,
@@ -615,39 +673,75 @@ class ExactLabelingPricing:
         beta,
         coverageDuals,
         slotDual,
-        existingSignatures,
+        existingSignatureIndex,
+        existingPrefixTrie,
         branchingState,
         activeSrcCuts,
         targetNegativeColumns=None,
     ):
         buckets = {}
         queue = deque()
-        negativeSequences = set()
+        negativeSignatures = set()
 
         requiredArcs = ()
         forbiddenArcs = frozenset()
+        requiredPrecedences = ()
+        forbiddenPrecedences = frozenset()
         if branchingState is not None:
             requiredArcs = tuple(sorted(branchingState.requiredArcs(slot)))
             forbiddenArcs = branchingState.forbiddenArcs(slot)
+            requiredPrecedences = tuple(sorted(branchingState.requiredPrecedences(slot)))
+            forbiddenPrecedences = branchingState.forbiddenPrecedences(slot)
 
-        requiredArcToBit = {
-            arc: 1 << index
-            for index, arc in enumerate(requiredArcs)
-        }
-        allRequiredMask = (1 << len(requiredArcs)) - 1
-
-        requiredSuccessor = {}
-        requiredPredecessor = {}
+        # Required physical arcs are enforced without a requiredArcMask.  For
+        # non-BSS tails/heads we fix the unique local successor/predecessor.  A
+        # required arc is then guaranteed once its customer endpoint(s) have
+        # been visited.  S is repeatable, so multiple S-incidence requirements
+        # can coexist and are forced through each customer's local incidence.
+        requiredOutgoing = {}
+        requiredIncoming = {}
+        requiredArcTaskMask = 0
         for u, v in requiredArcs:
-            requiredSuccessor[u] = v
-            requiredPredecessor[v] = u
+            if u != self.stationNode:
+                requiredOutgoing[u] = v
+            if v != self.stationNode:
+                requiredIncoming[v] = u
+            requiredArcTaskMask |= self.taskToBit.get(u, 0)
+            requiredArcTaskMask |= self.taskToBit.get(v, 0)
 
+        requiredPredMaskByTask = {}
+        forbiddenPredMaskByTask = {}
+        requiredPrecedenceTaskMask = 0
+        for i, j in requiredPrecedences:
+            iBit = self.taskToBit[i]
+            jBit = self.taskToBit[j]
+            requiredPredMaskByTask[j] = requiredPredMaskByTask.get(j, 0) | iBit
+            requiredPrecedenceTaskMask |= iBit | jBit
+        for i, j in forbiddenPrecedences:
+            forbiddenPredMaskByTask[j] = (
+                forbiddenPredMaskByTask.get(j, 0) | self.taskToBit[i]
+            )
+
+        mandatoryTaskMask = requiredArcTaskMask | requiredPrecedenceTaskMask
+
+        # Active divisor-2 SRCs do not require a stored label field.  Their
+        # future marginal reduced-cost function depends only on the parity of
+        # |unreachableMask ∩ S|.  We derive that parity from the four-field
+        # mathematical label and use it only as a dominance bucket discriminator.
+        # Without this discriminator two labels with different SRC parity can
+        # have different future cut penalties and must not dominate each other.
+        srcCutMasks = tuple(cutMask for _, _, cutMask in activeSrcCuts)
+        srcParityKeyByMask = {0: 0}
+
+        # Each SRC increment can be derived from the already-visited mask.
+        # When adding task j to a divisor-2 cut, the coefficient floor(count/2)
+        # increases iff the previous count in that cut was odd.
         srcMembershipByTask = {task: [] for task in self.tasks}
-        for srcIndex, (cut, penalty) in enumerate(activeSrcCuts):
-            srcBit = 1 << srcIndex
-            for task in cut.customers:
-                if task in srcMembershipByTask:
-                    srcMembershipByTask[task].append((srcBit, float(penalty)))
+        for _, penalty, cutMask in activeSrcCuts:
+            for task in self.tasks:
+                bit = self.taskToBit[task]
+                if cutMask & bit:
+                    srcMembershipByTask[task].append((cutMask, float(penalty)))
 
         stats = {
             'generatedLabels': 1,
@@ -664,214 +758,246 @@ class ExactLabelingPricing:
             'dominanceResourceComparisons': 0,
             'earlyStopped': False,
             'activeSrcDuals': len(activeSrcCuts),
+            'requiredPhysicalArcs': len(requiredArcs),
+            'requiredCustomerPrecedences': len(requiredPrecedences),
+            'forbiddenCustomerPrecedences': len(forbiddenPrecedences),
+            'mandatoryTaskCount': mandatoryTaskMask.bit_count(),
         }
 
         positiveDualByTask = {
-            task: max(0.0, float(coverageDuals[task]))
-            for task in self.tasks
+            task: max(0.0, float(coverageDuals[task])) for task in self.tasks
         }
         totalPositiveDual = sum(positiveDualByTask.values())
+        positiveVisitedByMask = {0: 0.0}
 
-        start = _PricingLabel(
+        startLabel = _PricingLabel(
             currentNode=self.data.startNode,
-            visitedMask=0,
-            lastTask=None,
-            duration=0.0,
             remainingEnergy=float(self.data.Q),
             partialReducedCost=0.0,
-            remainingPositiveDual=totalPositiveDual,
-            requiredMask=0,
-            srcParityMask=0,
-            predecessor=None,
-            addedTask=None,
+            unreachableMask=0,
         )
-        startBucket = self._getBucket(start, buckets)
-        startBucket.fronts[0] = [start]
+        startRecord = _LabelRecord(
+            label=startLabel,
+            predecessor=None,
+            addedNode=None,
+            existingPrefixState=existingPrefixTrie.advance(
+                0, self.data.startNode
+            ),
+        )
+        startBucket = self._getBucket(
+            startRecord, buckets, mandatoryTaskMask, srcCutMasks, srcParityKeyByMask
+        )
+        startBucket.fronts[0] = [startRecord]
         startBucket._registerMask(0)
-        queue.append(start)
+        queue.append(startRecord)
 
         while queue:
-            label = queue.popleft()
-            if not label.active:
+            record = queue.popleft()
+            if not record.active:
                 continue
+            label = record.label
 
-            if self._requiredArcsAlreadyImpossible(
+            if self._cannotBecomeNegative(
                 label,
-                requiredArcs,
-                requiredArcToBit,
+                slotDual,
+                totalPositiveDual,
+                positiveVisitedByMask,
             ):
-                stats['branchPrunedLabels'] += 1
-                continue
-
-            if self._cannotBecomeNegative(label=label, slotDual=slotDual):
                 stats['boundPrunedLabels'] += 1
                 continue
 
-            if label.visitedMask != 0 and label.currentNode != self.data.startNode:
-                if self._completionBranchCompatible(
+            # Any nonempty partial route may return to the depot, provided all
+            # branch-mandatory customers have already been served.
+            if label.unreachableMask != 0:
+                mandatoryComplete = (
+                    label.unreachableMask & mandatoryTaskMask
+                ) == mandatoryTaskMask
+                if mandatoryComplete and self._extensionBranchCompatible(
                     label,
+                    self.data.endNode,
                     forbiddenArcs,
-                    requiredSuccessor,
-                    requiredPredecessor,
+                    requiredOutgoing,
+                    requiredIncoming,
+                    requiredPredMaskByTask,
+                    forbiddenPredMaskByTask,
                 ):
-                    completion = self._completeToDepot(
-                        label,
-                        requiredArcToBit,
-                        beta,
-                    )
-                    if completion is not None:
-                        completedRequiredMask, completedPrefixRc = completion
-                        if completedRequiredMask == allRequiredMask:
-                            stats['completedRoutes'] += 1
-                            rc = completedPrefixRc - slotDual
-                            if rc < -self.reducedCostTolerance:
+                    completedPrefixRc = self._completeToDepot(label, beta)
+                    if completedPrefixRc is not None:
+                        stats['completedRoutes'] += 1
+                        rc = completedPrefixRc - slotDual
+                        if rc < -self.reducedCostTolerance:
+                            signature = self._reconstructNodes(record) + (
+                                self.data.endNode,
+                            )
+                            if (
+                                signature not in existingSignatureIndex
+                                and (
+                                    branchingState is None
+                                    or branchingState.isNodeSequenceCompatible(
+                                        slot, signature
+                                    )
+                                )
+                            ):
                                 stats['negativeCompletions'] += 1
-                                sequence = self._reconstructSequence(label)
-                                if sequence not in existingSignatures:
-                                    negativeSequences.add(sequence)
-                                    if (
-                                        targetNegativeColumns is not None
-                                        and len(negativeSequences) >= targetNegativeColumns
-                                    ):
-                                        stats['earlyStopped'] = True
-                                        self._finalizeStateStats(buckets, stats)
-                                        return negativeSequences, stats
-                else:
+                                negativeSignatures.add(signature)
+                                if (
+                                    targetNegativeColumns is not None
+                                    and len(negativeSignatures) >= targetNegativeColumns
+                                ):
+                                    stats['earlyStopped'] = True
+                                    self._finalizeStateStats(buckets, stats)
+                                    return negativeSignatures, stats
+                elif not mandatoryComplete:
                     stats['branchPrunedLabels'] += 1
 
-            current = label.currentNode
+            # Elementary customer extension.
             for task in self.tasks:
                 bit = self.taskToBit[task]
-                if label.visitedMask & bit:
+                if label.unreachableMask & bit:
                     continue
-
-                if not self._customerExtensionBranchCompatible(
+                if not self._extensionBranchCompatible(
                     label,
                     task,
                     forbiddenArcs,
-                    requiredSuccessor,
-                    requiredPredecessor,
+                    requiredOutgoing,
+                    requiredIncoming,
+                    requiredPredMaskByTask,
+                    forbiddenPredMaskByTask,
                 ):
                     stats['branchPrunedLabels'] += 1
                     continue
 
-                nextLabel = self._extendToCustomer(
-                    label,
+                nextRecord = self._extendToCustomer(
+                    record,
                     task,
                     bit,
                     coverageDuals,
-                    requiredArcToBit,
                     beta,
                     positiveDualByTask,
+                    positiveVisitedByMask,
                     srcMembershipByTask,
+                    existingPrefixTrie,
                 )
-                if nextLabel is None:
+                if nextRecord is None:
                     continue
-
                 stats['generatedLabels'] += 1
-                if self._requiredArcsAlreadyImpossible(
-                    nextLabel,
-                    requiredArcs,
-                    requiredArcToBit,
+                if self._cannotBecomeNegative(
+                    nextRecord.label,
+                    slotDual,
+                    totalPositiveDual,
+                    positiveVisitedByMask,
                 ):
-                    stats['branchPrunedLabels'] += 1
-                    continue
-                if self._cannotBecomeNegative(nextLabel, slotDual):
                     stats['boundPrunedLabels'] += 1
                     continue
-
-                bucket = self._getBucket(nextLabel, buckets)
-                if bucket.insert(nextLabel, queue, stats):
+                bucket = self._getBucket(
+                    nextRecord, buckets, mandatoryTaskMask, srcCutMasks, srcParityKeyByMask
+                )
+                if bucket.insert(nextRecord, queue, stats):
                     stats['acceptedLabels'] += 1
 
-            # Physical BSS visit: it does not create a compressed branching arc.
-            if current in self.taskToBit:
-                stationLabel = self._extendToStation(label, beta)
-                if stationLabel is not None:
-                    stats['generatedLabels'] += 1
-                    if self._cannotBecomeNegative(stationLabel, slotDual):
-                        stats['boundPrunedLabels'] += 1
-                        continue
-                    bucket = self._getBucket(stationLabel, buckets)
-                    if bucket.insert(stationLabel, queue, stats):
-                        stats['acceptedLabels'] += 1
+            # S is repeatable but can only be entered from a customer. Entering
+            # S resets energy. No station-entry predecessor is a resource.
+            if label.currentNode in self.taskToBit:
+                if self._extensionBranchCompatible(
+                    label,
+                    self.stationNode,
+                    forbiddenArcs,
+                    requiredOutgoing,
+                    requiredIncoming,
+                    requiredPredMaskByTask,
+                    forbiddenPredMaskByTask,
+                ):
+                    stationRecord = self._extendToStation(
+                        record, beta, existingPrefixTrie
+                    )
+                    if stationRecord is not None:
+                        stats['generatedLabels'] += 1
+                        if self._cannotBecomeNegative(
+                            stationRecord.label,
+                            slotDual,
+                            totalPositiveDual,
+                            positiveVisitedByMask,
+                        ):
+                            stats['boundPrunedLabels'] += 1
+                        else:
+                            bucket = self._getBucket(
+                                stationRecord,
+                                buckets,
+                                mandatoryTaskMask,
+                                srcCutMasks,
+                                srcParityKeyByMask,
+                            )
+                            if bucket.insert(stationRecord, queue, stats):
+                                stats['acceptedLabels'] += 1
+                else:
+                    stats['branchPrunedLabels'] += 1
 
         self._finalizeStateStats(buckets, stats)
-        return negativeSequences, stats
+        return negativeSignatures, stats
 
     def _finalizeStateStats(self, buckets, stats):
         stats['states'] = len(buckets)
         stats['maskStates'] = sum(bucket.maskCount for bucket in buckets.values())
 
-    def _reconstructSequence(self, label):
-        tasks = []
-        cursor = label
+    def _reconstructNodes(self, record):
+        added = []
+        cursor = record
         while cursor is not None:
-            if cursor.addedTask is not None:
-                tasks.append(cursor.addedTask)
+            if cursor.addedNode is not None:
+                added.append(cursor.addedNode)
             cursor = cursor.predecessor
-        tasks.reverse()
-        return tuple(tasks)
+        added.reverse()
+        return (self.data.startNode,) + tuple(added)
 
-    def _sequenceArcToNextTask(self, label, task):
-        previous = self.data.startNode if label.lastTask is None else label.lastTask
-        return (previous, task)
-
-    def _customerExtensionBranchCompatible(
+    def _extensionBranchCompatible(
         self,
         label,
-        task,
+        nextNode,
         forbiddenArcs,
-        requiredSuccessor,
-        requiredPredecessor,
+        requiredOutgoing,
+        requiredIncoming,
+        requiredPredMaskByTask,
+        forbiddenPredMaskByTask,
     ):
-        previous = self.data.startNode if label.lastTask is None else label.lastTask
-        sequenceArc = (previous, task)
-        if sequenceArc in forbiddenArcs:
+        current = label.currentNode
+        arc = (current, nextNode)
+        if arc in forbiddenArcs:
             return False
-        requiredNext = requiredSuccessor.get(previous)
-        if requiredNext is not None and requiredNext != task:
-            return False
-        requiredPrevious = requiredPredecessor.get(task)
-        if requiredPrevious is not None and requiredPrevious != previous:
-            return False
-        return True
 
-    def _completionBranchCompatible(
-        self,
-        label,
-        forbiddenArcs,
-        requiredSuccessor,
-        requiredPredecessor,
-    ):
-        lastTask = label.lastTask
-        sequenceArc = (lastTask, self.data.endNode)
-        if sequenceArc in forbiddenArcs:
+        requiredNext = requiredOutgoing.get(current)
+        if requiredNext is not None and requiredNext != nextNode:
             return False
-        requiredNext = requiredSuccessor.get(lastTask)
-        if requiredNext is not None and requiredNext != self.data.endNode:
+        requiredPrevious = requiredIncoming.get(nextNode)
+        if requiredPrevious is not None and requiredPrevious != current:
             return False
-        requiredPrevious = requiredPredecessor.get(self.data.endNode)
-        if requiredPrevious is not None and requiredPrevious != lastTask:
-            return False
+
+        if nextNode in self.taskToBit:
+            visited = label.unreachableMask
+            requiredPredMask = requiredPredMaskByTask.get(nextNode, 0)
+            if requiredPredMask and (visited & requiredPredMask) != requiredPredMask:
+                return False
+            forbiddenPredMask = forbiddenPredMaskByTask.get(nextNode, 0)
+            if visited & forbiddenPredMask:
+                return False
+
         return True
 
     def _extendToCustomer(
         self,
-        label,
+        record,
         task,
         bit,
         coverageDuals,
-        requiredArcToBit,
         beta,
         positiveDualByTask,
+        positiveVisitedByMask,
         srcMembershipByTask,
+        existingPrefixTrie,
     ):
-        sequenceArc = self._sequenceArcToNextTask(label, task)
+        label = record.label
         physicalArc = (label.currentNode, task)
         if physicalArc not in self.data.t or physicalArc not in self.data.e:
             return None
-
         newEnergy = (
             label.remainingEnergy
             - float(self.data.e[physicalArc])
@@ -881,132 +1007,135 @@ class ExactLabelingPricing:
             return None
 
         durationIncrement = float(self.data.t[physicalArc]) + float(self.data.p[task])
-        dual = float(coverageDuals[task])
+        newMask = label.unreachableMask | bit
 
-        newSrcParityMask = label.srcParityMask
         srcReducedCostIncrement = 0.0
-        for srcBit, penalty in srcMembershipByTask.get(task, ()):
-            if newSrcParityMask & srcBit:
+        for cutMask, penalty in srcMembershipByTask.get(task, ()):
+            if (label.unreachableMask & cutMask).bit_count() & 1:
                 srcReducedCostIncrement += penalty
-            newSrcParityMask ^= srcBit
 
-        return _PricingLabel(
+        nextLabel = _PricingLabel(
             currentNode=task,
-            visitedMask=label.visitedMask | bit,
-            lastTask=task,
-            duration=label.duration + durationIncrement,
             remainingEnergy=newEnergy,
             partialReducedCost=(
                 label.partialReducedCost
                 + beta * durationIncrement
-                - dual
+                - float(coverageDuals[task])
                 + srcReducedCostIncrement
             ),
-            remainingPositiveDual=(
-                label.remainingPositiveDual - positiveDualByTask[task]
+            unreachableMask=newMask,
+        )
+        if newMask not in positiveVisitedByMask:
+            positiveVisitedByMask[newMask] = (
+                positiveVisitedByMask[label.unreachableMask]
+                + positiveDualByTask[task]
+            )
+        return _LabelRecord(
+            label=nextLabel,
+            predecessor=record,
+            addedNode=task,
+            existingPrefixState=existingPrefixTrie.advance(
+                record.existingPrefixState, task
             ),
-            requiredMask=(
-                label.requiredMask | requiredArcToBit.get(sequenceArc, 0)
-            ),
-            srcParityMask=newSrcParityMask,
-            predecessor=label,
-            addedTask=task,
         )
 
-    def _extendToStation(self, label, beta):
+    def _extendToStation(self, record, beta, existingPrefixTrie):
+        label = record.label
         arc = (label.currentNode, self.stationNode)
         if arc not in self.data.t or arc not in self.data.e:
             return None
-
         arrivalEnergy = label.remainingEnergy - float(self.data.e[arc])
         if arrivalEnergy < self.data.QMin - 1e-9:
             return None
-
         durationIncrement = (
             float(self.data.t[arc]) + float(self.data.p[self.stationNode])
         )
-        return _PricingLabel(
+        nextLabel = _PricingLabel(
             currentNode=self.stationNode,
-            visitedMask=label.visitedMask,
-            lastTask=label.lastTask,
-            duration=label.duration + durationIncrement,
             remainingEnergy=float(self.data.Q),
             partialReducedCost=(
                 label.partialReducedCost + beta * durationIncrement
             ),
-            remainingPositiveDual=label.remainingPositiveDual,
-            requiredMask=label.requiredMask,
-            srcParityMask=label.srcParityMask,
-            predecessor=label,
-            addedTask=None,
+            unreachableMask=label.unreachableMask,
+        )
+        return _LabelRecord(
+            label=nextLabel,
+            predecessor=record,
+            addedNode=self.stationNode,
+            existingPrefixState=existingPrefixTrie.advance(
+                record.existingPrefixState, self.stationNode
+            ),
         )
 
-    def _completeToDepot(self, label, requiredArcToBit, beta):
-        lastTask = label.lastTask
-        sequenceArc = (lastTask, self.data.endNode)
+    def _completeToDepot(self, label, beta):
         physicalArc = (label.currentNode, self.data.endNode)
         if physicalArc not in self.data.t or physicalArc not in self.data.e:
             return None
-
         newEnergy = label.remainingEnergy - float(self.data.e[physicalArc])
         if newEnergy < self.data.QMin - 1e-9:
             return None
-
         durationIncrement = float(self.data.t[physicalArc])
-        return (
-            label.requiredMask | requiredArcToBit.get(sequenceArc, 0),
-            label.partialReducedCost + beta * durationIncrement,
+        return label.partialReducedCost + beta * durationIncrement
+
+    @staticmethod
+    def _srcParityKey(unreachableMask, srcCutMasks, cache):
+        """Return the active-SRC parity vector derived from ``unreachableMask``.
+
+        This is auxiliary dominance bookkeeping, not a mathematical resource
+        field.  For divisor-2 SRCs the future marginal cut cost is completely
+        determined by this parity vector.
+        """
+        key = cache.get(unreachableMask)
+        if key is not None:
+            return key
+        key = 0
+        for index, cutMask in enumerate(srcCutMasks):
+            if (unreachableMask & cutMask).bit_count() & 1:
+                key |= 1 << index
+        cache[unreachableMask] = key
+        return key
+
+    def _dominanceKey(
+        self,
+        record,
+        mandatoryTaskMask=0,
+        srcCutMasks=(),
+        srcParityKeyByMask=None,
+    ):
+        label = record.label
+
+        # Required arcs / required customer precedences can make some customers
+        # mandatory for this slot.  A label that has already discharged such an
+        # obligation does not have the same continuation set as one that has not.
+        # The progress is derived from the unreachable set; no extra label field
+        # is stored.
+        mandatoryProgress = label.unreachableMask & mandatoryTaskMask
+
+        if srcCutMasks:
+            if srcParityKeyByMask is None:
+                srcParityKeyByMask = {}
+            srcParity = self._srcParityKey(
+                label.unreachableMask, srcCutMasks, srcParityKeyByMask
+            )
+        else:
+            srcParity = 0
+
+        return (label.currentNode, mandatoryProgress, srcParity)
+
+    def _getBucket(
+        self,
+        record,
+        buckets,
+        mandatoryTaskMask=0,
+        srcCutMasks=(),
+        srcParityKeyByMask=None,
+    ):
+        key = self._dominanceKey(
+            record,
+            mandatoryTaskMask,
+            srcCutMasks,
+            srcParityKeyByMask,
         )
-
-    def _requiredArcsAlreadyImpossible(self, label, requiredArcs, requiredArcToBit):
-        if not requiredArcs:
-            return False
-
-        visited = label.visitedMask
-        lastTask = label.lastTask
-        hasTasks = visited != 0
-
-        for arc in requiredArcs:
-            bit = requiredArcToBit[arc]
-            if label.requiredMask & bit:
-                continue
-
-            u, v = arc
-            if u == self.data.startNode:
-                if hasTasks:
-                    return True
-                continue
-
-            if v == self.data.endNode:
-                uBit = self.taskToBit.get(u)
-                if uBit is not None and (visited & uBit) and lastTask != u:
-                    return True
-                continue
-
-            uBit = self.taskToBit.get(u)
-            vBit = self.taskToBit.get(v)
-            if uBit is None or vBit is None:
-                return True
-            if visited & vBit:
-                return True
-            if (visited & uBit) and lastTask != u:
-                return True
-
-        return False
-
-    def _dominanceKey(self, label):
-        lastSequenceNode = (
-            self.data.startNode if label.lastTask is None else label.lastTask
-        )
-        return (
-            label.currentNode,
-            lastSequenceNode,
-            label.requiredMask,
-            label.srcParityMask,
-        )
-
-    def _getBucket(self, label, buckets):
-        key = self._dominanceKey(label)
         bucket = buckets.get(key)
         if bucket is None:
             bucket = _MaskIndexedDominanceBucket(
@@ -1017,13 +1146,15 @@ class ExactLabelingPricing:
             buckets[key] = bucket
         return bucket
 
-    def _cannotBecomeNegative(self, label, slotDual):
-        # Future travel/service/swap/depot-return costs and future SRC penalties
-        # are optimistically zero; every remaining positive customer dual is
-        # optimistically collected.  This is therefore a valid lower bound.
-        optimisticRc = (
-            label.partialReducedCost
-            - label.remainingPositiveDual
-            - slotDual
-        )
+    def _cannotBecomeNegative(
+        self,
+        label,
+        slotDual,
+        totalPositiveDual,
+        positiveVisitedByMask,
+    ):
+        visitedPositive = positiveVisitedByMask[label.unreachableMask]
+        remainingPositiveDual = totalPositiveDual - visitedPositive
+        optimisticRc = label.partialReducedCost - remainingPositiveDual - slotDual
         return optimisticRc >= -self.reducedCostTolerance
+
