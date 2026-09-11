@@ -22,8 +22,19 @@ class ThresholdLabelingStatistics:
     branchPrunedLabels: int = 0
     completedRoutes: int = 0
     negativeCompletions: int = 0
+    nonElementaryNegativeCompletions: int = 0
     dominanceComparisons: int = 0
     earlyStopped: bool = False
+
+    # ng-route + DSSR diagnostics.  ``dssrPasses`` counts relaxed labeling
+    # passes inside one exact pricing call.  A pricing call still returns only
+    # genuine elementary columns, or an exact certificate that none exists.
+    dssrPasses: int = 0
+    dssrRefinements: int = 0
+    dssrCustomersAdded: int = 0
+    dssrCriticalCustomers: int = 0
+    dssrFallbackToElementary: bool = False
+    ngMode: bool = False
 
 
 @dataclass(slots=True)
@@ -33,7 +44,17 @@ class _ThresholdLabel:
     energy: float
     duration: float
     rc: float
-    unreachableMask: int
+
+    # ng-route memory plus all DSSR-critical customers visited so far.
+    # A customer in this mask cannot be visited next.  Noncritical customers
+    # can disappear from the mask according to the ng-neighborhood update and
+    # may therefore be repeated in the relaxation.
+    memoryMask: int
+
+    # Parity of visits to the active three-row SRC customer sets.  This is
+    # kept independently from ng memory: forgetting a customer for elementarity
+    # must not forget its SRC state.
+    srcParityKey: int = 0
 
     # Reconstruction / exact master-only-row protection metadata.
     pred: object = None
@@ -416,7 +437,13 @@ class HeuristicThresholdPricing:
 
 
 class _DominanceFront:
-    """Scan only labels that actually exist; never enumerate subset masks."""
+    """Dominance front for the current relaxed state space.
+
+    ``memoryMask`` is the *current* forbidden-customer memory: ng memory plus
+    all already visited DSSR-critical customers.  Hence the usual subset rule
+    remains valid: a label remembering fewer forbidden customers has at least
+    as many feasible continuations.
+    """
 
     def __init__(self, tolerance):
         self.tol = float(tolerance)
@@ -433,7 +460,7 @@ class _DominanceFront:
         )
         if not noveltyCompatible:
             return False
-        if (a.unreachableMask & b.unreachableMask) != a.unreachableMask:
+        if (a.memoryMask & b.memoryMask) != a.memoryMask:
             return False
         tol = self.tol
         return (
@@ -443,10 +470,10 @@ class _DominanceFront:
         )
 
     def insert(self, label, queue, stats):
-        card = label.unreachableMask.bit_count()
+        card = label.memoryMask.bit_count()
 
-        # Potential dominators must have a subset mask, hence no larger
-        # cardinality.  We only scan actual labels in those fronts.
+        # Potential dominators must have a subset memory mask, hence no larger
+        # cardinality.  Scan only fronts that actually exist.
         for oldCard, oldLabels in tuple(self.byCardinality.items()):
             if oldCard > card:
                 continue
@@ -480,16 +507,25 @@ class _DominanceFront:
 
 
 class ExactThresholdLabelingPricing:
-    """Exact vehicle-free ESPPRC for a fixed makespan threshold.
+    """Exact fixed-threshold pricing with optional ng-route + DSSR.
 
     Reduced cost:
 
       Phase I:  -sum_i pi_i a_ir + SRC terms
       Phase II: 1 - sum_i pi_i a_ir + SRC terms
 
-    Route duration is a monotone feasibility resource constrained by
-    ``duration <= threshold``.  There is no vehicle index, slot dual, or
-    makespan dual beta_k.
+    When ``useNgDssr`` is false, this is the original elementary ESPPRC.
+    When it is true, each exact pricing call starts from the current ng-route
+    relaxation.  If a negative non-elementary walk is found, every repeated
+    customer on those walks is made DSSR-critical and the relaxed labeling is
+    solved again.  Critical customers are remembered permanently for the
+    remainder of this fixed-threshold BPC solve.  In the worst case all
+    customers become critical, which is exactly the original ESPPRC.
+
+    Crucially, the method *never* returns a non-elementary walk as a master
+    column.  Returning no column is also exact: it only happens after a relaxed
+    pass has found no negative walk, or after the fallback full-elementary pass
+    has certified the same fact.
     """
 
     def __init__(
@@ -498,16 +534,29 @@ class ExactThresholdLabelingPricing:
         routeEvaluator,
         reducedCostTolerance=1e-8,
         dominanceTolerance=1e-10,
+        useNgDssr=True,
+        ngNeighborhoodSize=6,
+        dssrMaxIterations=None,
+        dssrMaxNonElementaryPerPass=8,
     ):
         self.data = modelData
         self.routeEvaluator = routeEvaluator
         self.reducedCostTolerance = float(reducedCostTolerance)
         self.dominanceTolerance = float(dominanceTolerance)
+        self.useNgDssr = bool(useNgDssr)
         self.stationNode = modelData.S[0]
         self.tasks = tuple(modelData.C)
         self.taskToBit = {task: 1 << index for index, task in enumerate(self.tasks)}
         self.allTaskMask = (1 << len(self.tasks)) - 1
+        self.ngNeighborhoodSize = max(1, min(int(ngNeighborhoodSize), max(1, len(self.tasks))))
+        self.dssrMaxIterations = (
+            max(1, len(self.tasks))
+            if dssrMaxIterations is None
+            else max(1, int(dssrMaxIterations))
+        )
+        self.dssrMaxNonElementaryPerPass = max(1, int(dssrMaxNonElementaryPerPass))
         self.lastStatistics = None
+        self._dssrCriticalMask = 0
 
         # Dense physical-node index used in hot loops.
         self.nodes = tuple(modelData.V)
@@ -523,7 +572,66 @@ class ExactThresholdLabelingPricing:
                 self.energy[self.nodeToIndex[u]][self.nodeToIndex[v]] = float(value)
 
         self._minDurationToEnd = self._computeRelaxedDurationToEnd()
+        self._ngNeighborhoodMasks = self._computeNgNeighborhoodMasks()
 
+    # ------------------------------------------------------------------
+    # ng-route / DSSR state management
+    # ------------------------------------------------------------------
+    def resetDssr(self):
+        """Reset DSSR critical customers for a new fixed-threshold solve."""
+        self._dssrCriticalMask = 0
+
+    @property
+    def dssrCriticalMask(self):
+        return int(self._dssrCriticalMask)
+
+    @property
+    def dssrCriticalCustomers(self):
+        return tuple(
+            task for task in self.tasks
+            if self._dssrCriticalMask & self.taskToBit[task]
+        )
+
+    def ngNeighborhood(self, task):
+        """Return the deterministic ng-neighborhood of ``task`` for diagnostics."""
+        mask = self._ngNeighborhoodMasks[task]
+        return tuple(t for t in self.tasks if mask & self.taskToBit[t])
+
+    def _computeNgNeighborhoodMasks(self):
+        """Build fixed nearest-customer ng neighborhoods.
+
+        The neighborhood contains the customer itself plus the closest
+        ``ngNeighborhoodSize-1`` customers according to directed travel time
+        from the customer (customer service at the destination is used only as
+        a deterministic secondary component).  The particular neighborhood
+        rule affects relaxation strength/performance, not exactness, because
+        DSSR can always recover full elementarity.
+        """
+        if not self.tasks:
+            return {}
+        if self.ngNeighborhoodSize >= len(self.tasks):
+            return {task: self.allTaskMask for task in self.tasks}
+
+        result = {}
+        for task in self.tasks:
+            ranked = []
+            for other in self.tasks:
+                if other == task:
+                    continue
+                travel = self.data.t.get((task, other), float('inf'))
+                service = float(self.data.p.get(other, 0.0))
+                ranked.append((float(travel) + service, other))
+            ranked.sort(key=lambda item: (item[0], item[1]))
+            chosen = [task] + [other for _, other in ranked[: self.ngNeighborhoodSize - 1]]
+            mask = 0
+            for customer in chosen:
+                mask |= self.taskToBit[customer]
+            result[task] = mask
+        return result
+
+    # ------------------------------------------------------------------
+    # Static preprocessing / master-dual helpers
+    # ------------------------------------------------------------------
     def _computeRelaxedDurationToEnd(self):
         """Shortest remaining duration ignoring energy and elementarity."""
         reverse = {node: [] for node in self.nodes}
@@ -568,15 +676,8 @@ class ExactThresholdLabelingPricing:
         return trie
 
     @staticmethod
-    def _srcParity(mask, activeSrcCuts):
-        key = 0
-        for idx, (cutMask, _) in enumerate(activeSrcCuts):
-            if (mask & cutMask).bit_count() & 1:
-                key |= 1 << idx
-        return key
-
-    def _bucketKey(self, label, activeSrcCuts):
-        return (label.node, self._srcParity(label.unreachableMask, activeSrcCuts))
+    def _bucketKey(label):
+        return (label.node, label.srcParityKey)
 
     def _durationCanFinish(self, node, duration, threshold):
         return duration + self._minDurationToEnd.get(node, float('inf')) <= threshold + 1e-9
@@ -584,6 +685,28 @@ class ExactThresholdLabelingPricing:
     def _arcForbidden(self, branchState, u, v):
         return branchState is not None and (u, v) in branchState.forbiddenArcs
 
+    @staticmethod
+    def _mergePassStatistics(total, part):
+        integerFields = (
+            'generatedLabels',
+            'acceptedLabels',
+            'dominatedLabels',
+            'removedByDominance',
+            'boundPrunedLabels',
+            'durationPrunedLabels',
+            'branchPrunedLabels',
+            'completedRoutes',
+            'negativeCompletions',
+            'nonElementaryNegativeCompletions',
+            'dominanceComparisons',
+        )
+        for name in integerFields:
+            setattr(total, name, getattr(total, name) + getattr(part, name))
+        total.earlyStopped = total.earlyStopped or part.earlyStopped
+
+    # ------------------------------------------------------------------
+    # Public exact pricing entry point
+    # ------------------------------------------------------------------
     def price(
         self,
         duals,
@@ -605,16 +728,136 @@ class ExactThresholdLabelingPricing:
 
         activeSrcCuts = self._activeSrcCuts(duals)
         protectedTrie = self._buildProtectedTrie(protectedSignatures)
+
+        totalStats = ThresholdLabelingStatistics(ngMode=self.useNgDssr)
+
+        # Baseline/full-elementary mode is the same engine with every customer
+        # DSSR-critical, so ng memory can never forget a visited customer.
+        if not self.useNgDssr:
+            candidates, _ = self._pricePass(
+                duals=duals,
+                existingIndex=existingIndex,
+                threshold=threshold,
+                phase=phase,
+                maxColumns=maxColumns,
+                branchingState=branchingState,
+                protectedTrie=protectedTrie,
+                activeSrcCuts=activeSrcCuts,
+                criticalMask=self.allTaskMask,
+                stats=totalStats,
+            )
+            totalStats.dssrPasses = 1
+            totalStats.dssrCriticalCustomers = len(self.tasks)
+            self.lastStatistics = totalStats
+            return candidates
+
+        criticalMask = int(self._dssrCriticalMask)
+        refinementsThisCall = 0
+
+        while True:
+            passStats = ThresholdLabelingStatistics(ngMode=True)
+            candidates, repeatedMask = self._pricePass(
+                duals=duals,
+                existingIndex=existingIndex,
+                threshold=threshold,
+                phase=phase,
+                maxColumns=maxColumns,
+                branchingState=branchingState,
+                protectedTrie=protectedTrie,
+                activeSrcCuts=activeSrcCuts,
+                criticalMask=criticalMask,
+                stats=passStats,
+            )
+            self._mergePassStatistics(totalStats, passStats)
+            totalStats.dssrPasses += 1
+
+            # Any returned columns are genuine elementary routes.  We can stop
+            # immediately and let the master reoptimize; certification is only
+            # needed when the pricing call returns no columns.
+            if candidates:
+                self._dssrCriticalMask = criticalMask
+                totalStats.dssrCriticalCustomers = criticalMask.bit_count()
+                self.lastStatistics = totalStats
+                return candidates
+
+            if repeatedMask:
+                newCritical = repeatedMask & ~criticalMask
+                if newCritical:
+                    criticalMask |= newCritical
+                    self._dssrCriticalMask = criticalMask
+                    refinementsThisCall += 1
+                    totalStats.dssrRefinements += 1
+                    totalStats.dssrCustomersAdded += newCritical.bit_count()
+
+                    # DSSR is finite because every refinement makes at least one
+                    # customer permanently elementary.  The iteration cap is a
+                    # performance guard only: hitting it falls back to the full
+                    # elementary state space rather than weakening exactness.
+                    if (
+                        refinementsThisCall >= self.dssrMaxIterations
+                        and criticalMask != self.allTaskMask
+                    ):
+                        newlyAdded = self.allTaskMask & ~criticalMask
+                        criticalMask = self.allTaskMask
+                        self._dssrCriticalMask = criticalMask
+                        totalStats.dssrCustomersAdded += newlyAdded.bit_count()
+                        totalStats.dssrFallbackToElementary = True
+                    continue
+
+                # Defensive progress guard.  A repeated DSSR-critical customer
+                # should be impossible; if numerical/state logic ever reaches
+                # here, recover exactness by switching to full elementarity.
+                if criticalMask != self.allTaskMask:
+                    newlyAdded = self.allTaskMask & ~criticalMask
+                    criticalMask = self.allTaskMask
+                    self._dssrCriticalMask = criticalMask
+                    totalStats.dssrCustomersAdded += newlyAdded.bit_count()
+                    totalStats.dssrFallbackToElementary = True
+                    continue
+
+            # The relaxed ng problem contains every elementary route.  If a
+            # complete relaxed pass has no negative walk, there cannot be a
+            # negative elementary route either: this is an exact certificate.
+            self._dssrCriticalMask = criticalMask
+            totalStats.dssrCriticalCustomers = criticalMask.bit_count()
+            self.lastStatistics = totalStats
+            return []
+
+    # ------------------------------------------------------------------
+    # One labeling pass for a fixed ng/DSSR memory state
+    # ------------------------------------------------------------------
+    def _pricePass(
+        self,
+        duals,
+        existingIndex,
+        threshold,
+        phase,
+        maxColumns,
+        branchingState,
+        protectedTrie,
+        activeSrcCuts,
+        criticalMask,
+        stats,
+    ):
         rootPrefix = protectedTrie.advance(0, self.data.startNode)
+        fullElementary = criticalMask == self.allTaskMask
 
-        positiveDual = {
-            task: max(0.0, float(duals.coverage.get(task, 0.0)))
-            for task in self.tasks
-        }
-        totalPositiveDual = sum(positiveDual.values())
-        positiveSumByMask = {0: 0.0}
+        # The positive-dual completion bound is valid only in the full
+        # elementary state space.  Under ng relaxation a forgotten customer may
+        # be revisited and collect its dual again, so using the old bound there
+        # would invalidate the relaxation/certificate.
+        if fullElementary:
+            positiveDual = {
+                task: max(0.0, float(duals.coverage.get(task, 0.0)))
+                for task in self.tasks
+            }
+            totalPositiveDual = sum(positiveDual.values())
+            positiveSumByMask = {0: 0.0}
+        else:
+            positiveDual = None
+            totalPositiveDual = None
+            positiveSumByMask = None
 
-        stats = ThresholdLabelingStatistics()
         queue = deque()
         buckets = {}
 
@@ -623,17 +866,20 @@ class ExactThresholdLabelingPricing:
             energy=float(self.data.Q),
             duration=0.0,
             rc=(0.0 if phase == 1 else 1.0),
-            unreachableMask=0,
+            memoryMask=0,
+            srcParityKey=0,
             pred=None,
             addedNode=None,
             protectedPrefixState=rootPrefix,
         )
-        rootKey = self._bucketKey(root, activeSrcCuts)
+        rootKey = self._bucketKey(root)
         buckets[rootKey] = _DominanceFront(self.dominanceTolerance)
         buckets[rootKey].insert(root, queue, stats)
         stats.acceptedLabels += 1
 
         negatives = {}
+        repeatedMask = 0
+        nonElementaryNegativeCount = 0
         earlyStop = False
 
         while queue and not earlyStop:
@@ -641,7 +887,7 @@ class ExactThresholdLabelingPricing:
             if not label.active:
                 continue
 
-            if self._cannotBecomeNegative(
+            if fullElementary and self._cannotBecomeNegative(
                 label, totalPositiveDual, positiveSumByMask
             ):
                 stats.boundPrunedLabels += 1
@@ -651,25 +897,46 @@ class ExactThresholdLabelingPricing:
                 continue
 
             # Complete to depot from customer or station.  Empty routes are not
-            # pricing columns in the vehicle-free master.
-            if label.unreachableMask and label.node != self.data.startNode:
+            # pricing columns in the vehicle-free master.  Once a customer has
+            # been visited, memoryMask is nonzero (BSS visits preserve it).
+            if label.memoryMask and label.node != self.data.startNode:
                 completed = self._completeToDepot(label, threshold, branchingState)
                 if completed is not None:
                     completeDuration, completeRc = completed
                     stats.completedRoutes += 1
                     if completeRc < -self.reducedCostTolerance:
+                        stats.negativeCompletions += 1
                         nodes = self._reconstructNodes(label) + (self.data.endNode,)
+                        repeats = self._repeatedCustomerMask(nodes)
+
+                        if repeats:
+                            # Never expose a non-elementary walk to the master.
+                            repeatedMask |= repeats
+                            nonElementaryNegativeCount += 1
+                            stats.nonElementaryNegativeCompletions += 1
+                            if (
+                                nonElementaryNegativeCount
+                                >= self.dssrMaxNonElementaryPerPass
+                            ):
+                                # We already have enough information to tighten
+                                # the state space.  No certificate is claimed.
+                                earlyStop = True
+                                break
+                            continue
+
                         signature = tuple(nodes)
                         if signature not in existingIndex:
                             column = self.routeEvaluator.evaluateNodes(signature)
-                            if column is not None and column.duration <= threshold + 1e-8:
+                            if (
+                                column is not None
+                                and column.duration <= threshold + 1e-8
+                            ):
                                 previous = negatives.get(signature)
                                 if previous is None or completeRc < previous.reducedCost:
                                     negatives[signature] = ThresholdPricingCandidate(
                                         column=column,
                                         reducedCost=float(completeRc),
                                     )
-                                    stats.negativeCompletions += 1
                                     if maxColumns is not None and len(negatives) >= maxColumns:
                                         earlyStop = True
                                         break
@@ -677,18 +944,19 @@ class ExactThresholdLabelingPricing:
             # Customer extensions.
             for task in self.tasks:
                 bit = self.taskToBit[task]
-                if label.unreachableMask & bit:
+                if label.memoryMask & bit:
                     continue
                 if self._arcForbidden(branchingState, label.node, task):
                     stats.branchPrunedLabels += 1
                     continue
                 nxt = self._extendToCustomer(
-                    label,
-                    task,
-                    bit,
-                    duals.coverage,
-                    activeSrcCuts,
-                    protectedTrie,
+                    label=label,
+                    task=task,
+                    bit=bit,
+                    coverageDuals=duals.coverage,
+                    activeSrcCuts=activeSrcCuts,
+                    protectedTrie=protectedTrie,
+                    criticalMask=criticalMask,
                 )
                 if nxt is None:
                     continue
@@ -698,15 +966,22 @@ class ExactThresholdLabelingPricing:
                 ):
                     stats.durationPrunedLabels += 1
                     continue
-                if nxt.unreachableMask not in positiveSumByMask:
-                    positiveSumByMask[nxt.unreachableMask] = (
-                        positiveSumByMask[label.unreachableMask]
-                        + positiveDual[task]
-                    )
-                if self._cannotBecomeNegative(nxt, totalPositiveDual, positiveSumByMask):
-                    stats.boundPrunedLabels += 1
-                    continue
-                key = self._bucketKey(nxt, activeSrcCuts)
+
+                if fullElementary:
+                    if nxt.memoryMask not in positiveSumByMask:
+                        # In the full-elementary pass memoryMask is exactly the
+                        # set of visited customers.
+                        positiveSumByMask[nxt.memoryMask] = (
+                            positiveSumByMask[label.memoryMask]
+                            + positiveDual[task]
+                        )
+                    if self._cannotBecomeNegative(
+                        nxt, totalPositiveDual, positiveSumByMask
+                    ):
+                        stats.boundPrunedLabels += 1
+                        continue
+
+                key = self._bucketKey(nxt)
                 front = buckets.get(key)
                 if front is None:
                     front = _DominanceFront(self.dominanceTolerance)
@@ -714,7 +989,9 @@ class ExactThresholdLabelingPricing:
                 if front.insert(nxt, queue, stats):
                     stats.acceptedLabels += 1
 
-            # Repeatable BSS extension from a customer only.
+            # Repeatable BSS extension from a customer only.  BSS is not an
+            # elementarity resource and therefore leaves ng/DSSR memory and SRC
+            # parity unchanged.
             if label.node in self.taskToBit:
                 if self._arcForbidden(branchingState, label.node, self.stationNode):
                     stats.branchPrunedLabels += 1
@@ -726,12 +1003,12 @@ class ExactThresholdLabelingPricing:
                             nxt.node, nxt.duration, threshold
                         ):
                             stats.durationPrunedLabels += 1
-                        elif self._cannotBecomeNegative(
+                        elif fullElementary and self._cannotBecomeNegative(
                             nxt, totalPositiveDual, positiveSumByMask
                         ):
                             stats.boundPrunedLabels += 1
                         else:
-                            key = self._bucketKey(nxt, activeSrcCuts)
+                            key = self._bucketKey(nxt)
                             front = buckets.get(key)
                             if front is None:
                                 front = _DominanceFront(self.dominanceTolerance)
@@ -744,8 +1021,7 @@ class ExactThresholdLabelingPricing:
         candidates.sort(key=lambda c: (c.reducedCost, c.column.duration, c.column.nodes))
         if maxColumns is not None:
             candidates = candidates[:maxColumns]
-        self.lastStatistics = stats
-        return candidates
+        return candidates, repeatedMask
 
     def _extendToCustomer(
         self,
@@ -755,6 +1031,7 @@ class ExactThresholdLabelingPricing:
         coverageDuals,
         activeSrcCuts,
         protectedTrie,
+        criticalMask,
     ):
         u = label.node
         ui = self.nodeToIndex.get(u)
@@ -769,19 +1046,36 @@ class ExactThresholdLabelingPricing:
         if newEnergy < self.data.QMin - 1e-9:
             return None
 
-        newMask = label.unreachableMask | bit
+        # Standard ng-memory update, strengthened by DSSR: critical customers
+        # are never forgotten, while noncritical memory is intersected with the
+        # neighborhood of the newly visited customer.
+        retainMask = self._ngNeighborhoodMasks[task] | criticalMask
+        newMemory = (label.memoryMask & retainMask) | bit
+
+        # In the relaxed problem a repeated customer collects its coverage dual
+        # again.  This makes the transition cost depend only on the relaxed
+        # state rather than on hidden full-history information, which is needed
+        # for valid ng-state dominance.  Every elementary path is unaffected.
         newRc = label.rc - float(coverageDuals.get(task, 0.0))
-        for cutMask, penalty in activeSrcCuts:
-            if task in self.taskToBit and (bit & cutMask):
-                if (label.unreachableMask & cutMask).bit_count() & 1:
+
+        # SRC state is independent of ng memory.  For divisor-2 three-row cuts,
+        # every second visit to the cut set incurs the nonnegative penalty.
+        # On elementary routes this is exactly floor(|S cap r|/2).
+        newParity = label.srcParityKey
+        for idx, (cutMask, penalty) in enumerate(activeSrcCuts):
+            if bit & cutMask:
+                parityBit = 1 << idx
+                if newParity & parityBit:
                     newRc += penalty
+                newParity ^= parityBit
 
         return _ThresholdLabel(
             node=task,
             energy=newEnergy,
             duration=label.duration + travel + float(self.data.p[task]),
             rc=newRc,
-            unreachableMask=newMask,
+            memoryMask=newMemory,
+            srcParityKey=newParity,
             pred=label,
             addedNode=task,
             protectedPrefixState=protectedTrie.advance(
@@ -808,7 +1102,8 @@ class ExactThresholdLabelingPricing:
             energy=float(self.data.Q),
             duration=label.duration + travel + float(self.data.p[s]),
             rc=label.rc,
-            unreachableMask=label.unreachableMask,
+            memoryMask=label.memoryMask,
+            srcParityKey=label.srcParityKey,
             pred=label,
             addedNode=s,
             protectedPrefixState=protectedTrie.advance(
@@ -836,12 +1131,7 @@ class ExactThresholdLabelingPricing:
         return duration, label.rc
 
     def _cannotBecomeNegative(self, label, totalPositiveDual, positiveSumByMask):
-        visitedPositive = positiveSumByMask.get(label.unreachableMask)
-        if visitedPositive is None:
-            visitedPositive = 0.0
-            for task, bit in self.taskToBit.items():
-                if label.unreachableMask & bit:
-                    visitedPositive += 0.0  # populated by caller on generated masks
+        visitedPositive = positiveSumByMask.get(label.memoryMask, 0.0)
         remaining = totalPositiveDual - visitedPositive
         return label.rc - remaining >= -self.reducedCostTolerance
 
@@ -854,3 +1144,15 @@ class ExactThresholdLabelingPricing:
             cursor = cursor.pred
         added.reverse()
         return (self.data.startNode,) + tuple(added)
+
+    def _repeatedCustomerMask(self, nodes):
+        seen = 0
+        repeated = 0
+        for node in nodes:
+            bit = self.taskToBit.get(node, 0)
+            if not bit:
+                continue
+            if seen & bit:
+                repeated |= bit
+            seen |= bit
+        return repeated

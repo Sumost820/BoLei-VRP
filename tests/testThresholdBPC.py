@@ -22,6 +22,7 @@ def testThresholdMakespanBpcEndToEndAgainstExactPathModel():
         useHeuristicPricing=True,          # 启发式定价
         timeLimit=3600,                    # 最大运行时间
         useSrcCuts=True,                   # SRC
+        useNgDssr=True,                    # NG-DSSR
     )
 
     result = solver.solve(lowerBound=0.0, upperBound=None, outputFlag=1)

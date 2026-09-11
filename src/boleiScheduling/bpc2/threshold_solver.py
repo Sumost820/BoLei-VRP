@@ -52,6 +52,10 @@ class ThresholdFeasibilityResult:
     runtime: float = 0.0
     pricingCalls: int = 0
     pricingLabels: int = 0
+    ngDssrPasses: int = 0
+    dssrRefinements: int = 0
+    dssrCustomersAdded: int = 0
+    dssrPeakCriticalCustomers: int = 0
     heuristicPricingCalls: int = 0
     heuristicColumns: int = 0
     masterBuildTime: float = 0.0
@@ -93,6 +97,10 @@ class ThresholdMakespanResult:
     pricingCalls: int = 0
     heuristicPricingCalls: int = 0
     pricingLabels: int = 0
+    ngDssrPasses: int = 0
+    dssrRefinements: int = 0
+    dssrCustomersAdded: int = 0
+    dssrPeakCriticalCustomers: int = 0
     heuristicColumns: int = 0
     bssCuts: int = 0
     srcCuts: int = 0
@@ -122,6 +130,10 @@ class ThresholdFeasibilityBpcSolver:
         heuristicGreedyCandidateLimit=16,
         reducedCostTolerance=1e-8,
         dominanceTolerance=1e-10,
+        useNgDssr=True,
+        ngNeighborhoodSize=6,
+        dssrMaxIterations=None,
+        dssrMaxNonElementaryPerPass=8,
         phaseOneTolerance=1e-8,
         integralityTolerance=1e-7,
         bssTolerance=1e-7,
@@ -148,7 +160,13 @@ class ThresholdFeasibilityBpcSolver:
             self.routeEvaluator,
             reducedCostTolerance=reducedCostTolerance,
             dominanceTolerance=dominanceTolerance,
+            useNgDssr=useNgDssr,
+            ngNeighborhoodSize=ngNeighborhoodSize,
+            dssrMaxIterations=dssrMaxIterations,
+            dssrMaxNonElementaryPerPass=dssrMaxNonElementaryPerPass,
         )
+        self.useNgDssr = bool(useNgDssr)
+        self.ngNeighborhoodSize = int(ngNeighborhoodSize)
         self.heuristicPricing = HeuristicThresholdPricing(
             modelData,
             self.routeEvaluator,
@@ -194,6 +212,10 @@ class ThresholdFeasibilityBpcSolver:
         # separately.
         self._pricingCalls = 0
         self._pricingLabels = 0
+        self._ngDssrPasses = 0
+        self._dssrRefinements = 0
+        self._dssrCustomersAdded = 0
+        self._dssrPeakCriticalCustomers = 0
         self._heuristicPricingCalls = 0
         self._heuristicColumns = 0
 
@@ -371,19 +393,39 @@ class ThresholdFeasibilityBpcSolver:
             exactPricingElapsed = time.perf_counter() - exactPricingStarted
             self._exactPricingTime += exactPricingElapsed
             self._pricingCalls += 1
-            if self.pricing.lastStatistics is not None:
-                self._pricingLabels += self.pricing.lastStatistics.generatedLabels
+            pstats = self.pricing.lastStatistics
+            if pstats is not None:
+                self._pricingLabels += pstats.generatedLabels
+                self._ngDssrPasses += pstats.dssrPasses
+                self._dssrRefinements += pstats.dssrRefinements
+                self._dssrCustomersAdded += pstats.dssrCustomersAdded
+                self._dssrPeakCriticalCustomers = max(
+                    self._dssrPeakCriticalCustomers,
+                    pstats.dssrCriticalCustomers,
+                )
 
             if outputFlag >= 2:
                 rc = candidates[0].reducedCost if candidates else None
                 art = master.getPhaseOneArtificialValue() if phase == 1 else None
+                tag = 'TH-NG' if self.useNgDssr else 'TH-EP'
+                ngText = ''
+                if self.useNgDssr and pstats is not None:
+                    ngText = (
+                        f' ng={self.pricing.ngNeighborhoodSize} '
+                        f'passes={pstats.dssrPasses} '
+                        f'refine={pstats.dssrRefinements} '
+                        f'crit={pstats.dssrCriticalCustomers}/{len(self.data.C)} '
+                        f'nonElemNeg={pstats.nonElementaryNegativeCompletions}'
+                        + (' fallback=ESPPRC' if pstats.dssrFallbackToElementary else '')
+                    )
                 print(
-                    f'      [TH-EP-P{phase}] iter={iteration:03d} '
+                    f'      [{tag}-P{phase}] iter={iteration:03d} '
                     f'obj={master.getObjectiveValue():.6f} '
                     + (f'art={art:.3e} ' if art is not None else '')
                     + f'cols={len(self.columnManager)} '
                     + f'time={exactPricingElapsed:.3f}s '
                     + (f'bestRC={rc:.6g}' if rc is not None else 'bestRC=none')
+                    + ngText
                 )
 
             if not candidates:
@@ -417,10 +459,18 @@ class ThresholdFeasibilityBpcSolver:
         threshold = float(threshold)
         started = time.perf_counter()
         self._activeOutputFlag = int(outputFlag)
+        # DSSR critical customers are intentionally persistent across all CG
+        # rounds / branch nodes of this fixed threshold, but reset between
+        # different threshold solves.
+        self.pricing.resetDssr()
 
         # Reset per-threshold statistics in case this solver object is reused.
         self._pricingCalls = 0
         self._pricingLabels = 0
+        self._ngDssrPasses = 0
+        self._dssrRefinements = 0
+        self._dssrCustomersAdded = 0
+        self._dssrPeakCriticalCustomers = 0
         self._heuristicPricingCalls = 0
         self._heuristicColumns = 0
         self._masterBuildTime = 0.0
@@ -678,6 +728,10 @@ class ThresholdFeasibilityBpcSolver:
             runtime=time.perf_counter() - started,
             pricingCalls=self._pricingCalls,
             pricingLabels=self._pricingLabels,
+            ngDssrPasses=self._ngDssrPasses,
+            dssrRefinements=self._dssrRefinements,
+            dssrCustomersAdded=self._dssrCustomersAdded,
+            dssrPeakCriticalCustomers=self._dssrPeakCriticalCustomers,
             heuristicPricingCalls=self._heuristicPricingCalls,
             heuristicColumns=self._heuristicColumns,
             masterBuildTime=float(self._masterBuildTime),
@@ -701,7 +755,12 @@ class ThresholdFeasibilityBpcSolver:
                 f'calls={result.masterOptimizeCalls}) | '
                 f'pricing={result.pricingTime:.3f}s '
                 f'(HP={result.heuristicPricingTime:.3f}s, EP={result.exactPricingTime:.3f}s) | '
-                f'BSS={result.bssSchedulingTime:.3f}s | '
+                + (
+                    f'NG/DSSR={result.ngDssrPasses}p/{result.dssrRefinements}r '
+                    f'critPeak={result.dssrPeakCriticalCustomers}/{len(self.data.C)} | '
+                    if self.useNgDssr else ''
+                )
+                + f'BSS={result.bssSchedulingTime:.3f}s | '
                 f'SRCsep={result.srcSeparationTime:.3f}s/{result.srcSeparationCalls} | '
                 f'cuts={result.totalCuts} (BSS={result.bssCuts}, SRC={result.srcCuts})'
             )
@@ -733,11 +792,15 @@ class ThresholdMakespanBpcSolver:
         heuristicMaxReplacementPositionsPerSeed=5,
         heuristicGreedyStarts=8,
         heuristicGreedyCandidateLimit=16,
+        useNgDssr=True,
+        ngNeighborhoodSize=6,
+        dssrMaxIterations=None,
+        dssrMaxNonElementaryPerPass=8,
         useSrcCuts=False,
         srcRootOnly=True,
         srcViolationTolerance=1e-7,
         maxSrcCutsPerRound=5,
-        maxSrcCutsPerThreshold=100,
+        maxSrcCutsPerThreshold=20,
         useSavingsWarmStart=True,
         savingsStarts=12,
         savingsSeed=1,
@@ -760,6 +823,10 @@ class ThresholdMakespanBpcSolver:
         self.heuristicMaxReplacementPositionsPerSeed = int(heuristicMaxReplacementPositionsPerSeed)
         self.heuristicGreedyStarts = int(heuristicGreedyStarts)
         self.heuristicGreedyCandidateLimit = int(heuristicGreedyCandidateLimit)
+        self.useNgDssr = bool(useNgDssr)
+        self.ngNeighborhoodSize = int(ngNeighborhoodSize)
+        self.dssrMaxIterations = dssrMaxIterations
+        self.dssrMaxNonElementaryPerPass = int(dssrMaxNonElementaryPerPass)
         self.useSrcCuts = bool(useSrcCuts)
         self.srcRootOnly = bool(srcRootOnly)
         self.srcViolationTolerance = float(srcViolationTolerance)
@@ -832,6 +899,10 @@ class ThresholdMakespanBpcSolver:
             heuristicMaxReplacementPositionsPerSeed=self.heuristicMaxReplacementPositionsPerSeed,
             heuristicGreedyStarts=self.heuristicGreedyStarts,
             heuristicGreedyCandidateLimit=self.heuristicGreedyCandidateLimit,
+            useNgDssr=self.useNgDssr,
+            ngNeighborhoodSize=self.ngNeighborhoodSize,
+            dssrMaxIterations=self.dssrMaxIterations,
+            dssrMaxNonElementaryPerPass=self.dssrMaxNonElementaryPerPass,
             useSrcCuts=self.useSrcCuts,
             srcRootOnly=self.srcRootOnly,
             srcViolationTolerance=self.srcViolationTolerance,
@@ -1017,6 +1088,14 @@ class ThresholdMakespanBpcSolver:
             f'exact={result.pricingCalls}, exact labels={result.pricingLabels}, '
             f'heuristic cols={result.heuristicColumns}'
         )
+        if self.useNgDssr:
+            print(
+                f'NG + DSSR     : passes={result.ngDssrPasses}, '
+                f'refinements={result.dssrRefinements}, '
+                f'critical added={result.dssrCustomersAdded}, '
+                f'peak critical={result.dssrPeakCriticalCustomers}/{len(self.data.C)}, '
+                f'ng size={self.ngNeighborhoodSize}'
+            )
         print(f'BSS schedule  : {self._formatNumber(result.bssSchedulingTime, 3)} s')
         print(
             f'SRC separation: {self._formatNumber(result.srcSeparationTime, 3)} s '
@@ -1079,6 +1158,13 @@ class ThresholdMakespanBpcSolver:
         pricingCalls = sum(item.pricingCalls for item in history)
         heuristicPricingCalls = sum(item.heuristicPricingCalls for item in history)
         pricingLabels = sum(item.pricingLabels for item in history)
+        ngDssrPasses = sum(item.ngDssrPasses for item in history)
+        dssrRefinements = sum(item.dssrRefinements for item in history)
+        dssrCustomersAdded = sum(item.dssrCustomersAdded for item in history)
+        dssrPeakCriticalCustomers = max(
+            (item.dssrPeakCriticalCustomers for item in history),
+            default=0,
+        )
         heuristicColumns = sum(item.heuristicColumns for item in history)
         bssCuts = sum(item.bssCuts for item in history)
         srcCuts = sum(item.srcCuts for item in history)
@@ -1110,6 +1196,10 @@ class ThresholdMakespanBpcSolver:
             pricingCalls=int(pricingCalls),
             heuristicPricingCalls=int(heuristicPricingCalls),
             pricingLabels=int(pricingLabels),
+            ngDssrPasses=int(ngDssrPasses),
+            dssrRefinements=int(dssrRefinements),
+            dssrCustomersAdded=int(dssrCustomersAdded),
+            dssrPeakCriticalCustomers=int(dssrPeakCriticalCustomers),
             heuristicColumns=int(heuristicColumns),
             bssCuts=int(bssCuts),
             srcCuts=int(srcCuts),
